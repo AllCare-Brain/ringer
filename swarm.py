@@ -9,12 +9,14 @@ import os
 import re
 import shlex
 import signal
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import tomllib
 import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,16 +26,245 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-CODEX_BIN = "/opt/homebrew/bin/codex"
+TOOL_NAME = "swarm"
+STATE_DIR_NAME = ".swarm"
+ENV_VAR_PREFIX = "SWARM"
+
+CONFIG_DIR_NAME = TOOL_NAME
+CONFIG_FILE_NAME = "config.toml"
+DEFAULT_ENGINE_NAME = "codex"
 DEFAULT_TIMEOUT_S = 900
 CHECK_TIMEOUT_S = 60
-RUNS_DIR = Path.home() / ".swarm" / "runs"
-JSONL_FALLBACK_PATH = Path.home() / "fleet" / "swarm" / "runs.jsonl"
-SUPABASE_ENV_PATH = Path.home() / ".claude" / "data" / "supabase.env"
-WORKER_ENGINE = "codex gpt-5.5"
-SHEPHERD_MODEL = "none (swarm.py)"
+DEFAULT_DASHBOARD_PORT_BASE = 8787
+DEFAULT_TOKEN_REGEX = r"tokens\s+used\s*:?\s*([0-9][0-9,]*)"
+SHEPHERD_MODEL = f"none ({TOOL_NAME}.py)"
 VERIFY_METHOD = "executed-check"
-SWARM_HUD_APP_PATH = Path("/Users/jonathanedwards/fleet/swarm/SwarmHUD.app")
+DASHBOARD_HTML_PATH = Path(__file__).resolve().parent / "dashboard" / "dashboard.html"
+MINIMAL_DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>swarm dashboard</title></head>
+<body style="font-family: system-ui, sans-serif; background:#080a0f; color:#eef4ff;">
+<main id="app">dashboard/dashboard.html is missing</main>
+<script>
+function update(states) {
+  document.getElementById("app").textContent = JSON.stringify(states, null, 2);
+}
+</script>
+</body>
+</html>
+"""
+
+
+@dataclass(frozen=True)
+class EngineConfig:
+    name: str
+    bin: str
+    args_template: tuple[str, ...]
+    full_access_args: tuple[str, ...]
+    sandbox_args: tuple[str, ...]
+    token_regex: str | None = DEFAULT_TOKEN_REGEX
+
+    @property
+    def process_name(self) -> str:
+        return Path(self.bin).name or self.name
+
+
+@dataclass(frozen=True)
+class PostgresEvalConfig:
+    env_file: Path
+
+
+@dataclass(frozen=True)
+class EvalConfig:
+    backend: str
+    jsonl_path: Path
+    postgres: PostgresEvalConfig | None = None
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    path: Path | None
+    identity_default: str | None
+    state_dir: Path
+    dashboard_port_base: int
+    hud_app_path: Path | None
+    allow_full_access: bool
+    eval: EvalConfig
+    engines: dict[str, EngineConfig]
+
+    @classmethod
+    def load(cls, path: Path | None = None) -> "AppConfig":
+        config_path = path or env_config_path() or default_config_path()
+        explicit = path is not None or env_config_path() is not None
+        data: dict[str, Any] = {}
+        if config_path.exists():
+            with config_path.open("rb") as fh:
+                loaded = tomllib.load(fh)
+            if not isinstance(loaded, dict):
+                raise ValueError("config root must be a TOML table")
+            data = loaded
+        elif explicit:
+            raise ValueError(f"config file not found: {config_path}")
+
+        state_dir = expand_path(data.get("state_dir"), default_state_dir())
+        dashboard_port_base = int(data.get("dashboard_port_base", DEFAULT_DASHBOARD_PORT_BASE))
+        if dashboard_port_base <= 0:
+            raise ValueError("dashboard_port_base must be positive")
+        identity_default = optional_string(data.get("identity_default"))
+        hud_app_path = optional_path(data.get("hud_app_path"))
+        allow_full_access = bool(data.get("allow_full_access", False))
+        eval_config = load_eval_config(data.get("eval"), state_dir)
+        engines = load_engines(data.get("engines"))
+        return cls(
+            path=config_path if config_path.exists() else None,
+            identity_default=identity_default,
+            state_dir=state_dir,
+            dashboard_port_base=dashboard_port_base,
+            hud_app_path=hud_app_path,
+            allow_full_access=allow_full_access,
+            eval=eval_config,
+            engines=engines,
+        )
+
+
+def default_config_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME")
+    config_home = Path(base).expanduser() if base else Path.home() / ".config"
+    return config_home / CONFIG_DIR_NAME / CONFIG_FILE_NAME
+
+
+def env_config_path() -> Path | None:
+    value = os.environ.get(f"{ENV_VAR_PREFIX}_CONFIG")
+    if not value or not value.strip():
+        return None
+    return Path(value).expanduser().resolve()
+
+
+def default_state_dir() -> Path:
+    return Path.home() / STATE_DIR_NAME
+
+
+def expand_path(value: Any, default: Path) -> Path:
+    if value is None:
+        return default.expanduser().resolve()
+    return Path(str(value)).expanduser().resolve()
+
+
+def optional_path(value: Any) -> Path | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return Path(text).expanduser().resolve()
+
+
+def optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def as_string_tuple(value: Any, *, key: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError(f"{key} must be a list")
+    return tuple(str(item) for item in value)
+
+
+def built_in_codex_engine() -> EngineConfig:
+    resolved = shutil.which(DEFAULT_ENGINE_NAME) or DEFAULT_ENGINE_NAME
+    return EngineConfig(
+        name=DEFAULT_ENGINE_NAME,
+        bin=resolved,
+        args_template=(
+            "exec",
+            "--skip-git-repo-check",
+            "{access_args}",
+            "-C",
+            "{taskdir}",
+            "{spec}",
+        ),
+        full_access_args=("--dangerously-bypass-approvals-and-sandbox",),
+        sandbox_args=("--sandbox", "workspace-write"),
+        token_regex=DEFAULT_TOKEN_REGEX,
+    )
+
+
+def load_eval_config(raw: Any, state_dir: Path) -> EvalConfig:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("eval must be a TOML table")
+    backend = str(raw.get("backend", "jsonl")).strip().lower()
+    if backend not in {"jsonl", "postgres"}:
+        raise ValueError("eval.backend must be 'jsonl' or 'postgres'")
+    jsonl_path = expand_path(raw.get("jsonl_path"), state_dir / "runs.jsonl")
+    postgres: PostgresEvalConfig | None = None
+    postgres_raw = raw.get("postgres")
+    if postgres_raw is not None:
+        if not isinstance(postgres_raw, dict):
+            raise ValueError("eval.postgres must be a TOML table")
+        env_file_raw = optional_string(postgres_raw.get("env_file"))
+        if env_file_raw is None:
+            raise ValueError("eval.postgres.env_file is required")
+        env_file = Path(env_file_raw).expanduser().resolve()
+        postgres = PostgresEvalConfig(env_file=env_file)
+    if backend == "postgres" and postgres is None:
+        raise ValueError("eval.backend='postgres' requires [eval.postgres].env_file")
+    return EvalConfig(backend=backend, jsonl_path=jsonl_path, postgres=postgres)
+
+
+def load_engines(raw: Any) -> dict[str, EngineConfig]:
+    engines: dict[str, EngineConfig] = {DEFAULT_ENGINE_NAME: built_in_codex_engine()}
+    if raw is None:
+        return engines
+    if not isinstance(raw, dict):
+        raise ValueError("engines must be a TOML table")
+    for name, section in raw.items():
+        if not isinstance(section, dict):
+            raise ValueError(f"engines.{name} must be a TOML table")
+        clean_name = str(name).strip()
+        if not clean_name:
+            raise ValueError("engine name must not be empty")
+        base = engines.get(clean_name)
+        default_bin = base.bin if base else clean_name
+        bin_path = str(section.get("bin", default_bin)).strip()
+        if not bin_path:
+            raise ValueError(f"engines.{clean_name}.bin must not be empty")
+        args_template = as_string_tuple(
+            section.get("args_template", list(base.args_template) if base else None),
+            key=f"engines.{clean_name}.args_template",
+        )
+        if not args_template:
+            raise ValueError(f"engines.{clean_name}.args_template must not be empty")
+        full_access_args = as_string_tuple(
+            section.get("full_access_args", list(base.full_access_args) if base else []),
+            key=f"engines.{clean_name}.full_access_args",
+        )
+        sandbox_args = as_string_tuple(
+            section.get("sandbox_args", list(base.sandbox_args) if base else []),
+            key=f"engines.{clean_name}.sandbox_args",
+        )
+        token_regex = optional_string(section.get("token_regex"))
+        if token_regex is None and base is not None:
+            token_regex = base.token_regex
+        if token_regex:
+            try:
+                re.compile(token_regex, flags=re.IGNORECASE)
+            except re.error as exc:
+                raise ValueError(f"engines.{clean_name}.token_regex is invalid: {exc}") from exc
+        engines[clean_name] = EngineConfig(
+            name=clean_name,
+            bin=bin_path,
+            args_template=args_template,
+            full_access_args=full_access_args,
+            sandbox_args=sandbox_args,
+            token_regex=token_regex,
+        )
+    return engines
 
 
 @dataclass(frozen=True)
@@ -41,6 +272,7 @@ class TaskSpec:
     key: str
     spec: str
     check: str
+    engine: str = DEFAULT_ENGINE_NAME
     expect_files: tuple[str, ...] = ()
     timeout_s: int = DEFAULT_TIMEOUT_S
     full_access: bool = False
@@ -59,6 +291,9 @@ class TaskSpec:
         expect_files = obj.get("expect_files", [])
         if not isinstance(expect_files, list):
             raise ValueError(f"task {key}: expect_files must be a list")
+        engine = str(obj.get("engine", DEFAULT_ENGINE_NAME)).strip()
+        if not engine:
+            raise ValueError(f"task {key}: engine must not be empty")
         timeout_s = int(obj.get("timeout_s", DEFAULT_TIMEOUT_S))
         if timeout_s <= 0:
             raise ValueError(f"task {key}: timeout_s must be positive")
@@ -66,6 +301,7 @@ class TaskSpec:
             key=key,
             spec=spec,
             check=check,
+            engine=engine,
             expect_files=tuple(str(item) for item in expect_files),
             timeout_s=timeout_s,
             full_access=bool(obj.get("full_access", False)),
@@ -213,18 +449,24 @@ class ProcessTree:
         return children, commands
 
     @staticmethod
-    def count_codex_descendants(
-        root_pid: int | None, children: dict[int, list[int]], commands: dict[int, str]
+    def count_named_descendants(
+        root_pid: int | None,
+        children: dict[int, list[int]],
+        commands: dict[int, str],
+        process_name: str,
     ) -> int:
         if root_pid is None:
             return 0
+        needle = process_name.lower()
         count = 0
         stack = list(children.get(root_pid, []))
         while stack:
             pid = stack.pop()
             command = commands.get(pid, "")
-            if "codex" in Path(command.split()[0]).name.lower() if command else False:
-                count += 1
+            if command:
+                executable = Path(command.split()[0]).name.lower()
+                if needle and needle in executable:
+                    count += 1
             stack.extend(children.get(pid, []))
         return count
 
@@ -235,6 +477,8 @@ class StateWriter:
         run_id: str,
         run_name: str,
         identity: str,
+        state_dir: Path,
+        engines: dict[str, EngineConfig],
         started_at: datetime,
         runtimes: list[TaskRuntime],
         lock: threading.RLock,
@@ -243,10 +487,11 @@ class StateWriter:
         self.run_id = run_id
         self.run_name = run_name
         self.identity = identity
+        self.engines = engines
         self.started_at = started_at
         self.runtimes = runtimes
         self.lock = lock
-        self.path = path or (RUNS_DIR / f"{run_id}.json")
+        self.path = path or (state_dir / "runs" / f"{run_id}.json")
         self.pid = os.getpid()
         self.port: int | None = None
         self.finished = False
@@ -290,15 +535,18 @@ class StateWriter:
             tasks = []
             for runtime in self.runtimes:
                 log_tail = tail_lines(runtime.taskdir / "worker.log", line_count=3)
+                engine = self.engines.get(runtime.task.engine)
+                process_name = engine.process_name if engine else runtime.task.engine
                 tasks.append(
                     {
                         "key": runtime.task.key,
                         "status": runtime.status,
+                        "engine": runtime.task.engine,
                         "spec_short": runtime.spec_short,
                         "elapsed_s": round(runtime.elapsed_s(now), 1),
                         "tokens": runtime.tokens,
-                        "children": ProcessTree.count_codex_descendants(
-                            runtime.worker_pid, children, commands
+                        "children": ProcessTree.count_named_descendants(
+                            runtime.worker_pid, children, commands, process_name
                         ),
                         "log_tail": log_tail,
                     }
@@ -319,13 +567,18 @@ class StateWriter:
                 "run_id": self.run_id,
                 "run_name": self.run_name,
                 "identity": self.identity,
+                "state": "finished" if self.finished else "live",
                 "pid": self.pid,
                 "port": self.port,
                 "finished": self.finished,
                 "summary": self.summary if self.finished else None,
                 "started_at": self.started_at.isoformat(),
+                "elapsed_s": max((float(item["elapsed_s"]) for item in tasks), default=0.0),
                 "tasks": tasks,
                 "totals": totals,
+                "pass": totals["pass"],
+                "fail": totals["fail"],
+                "tokens": totals["tokens"],
             }
 
     def build_summary(self) -> dict[str, int]:
@@ -348,11 +601,13 @@ class Dashboard:
     def __init__(
         self,
         state_path: Path,
-        preferred_port: int = 8787,
+        preferred_port: int,
+        hud_app_path: Path | None = None,
         force_browser: bool = False,
     ) -> None:
         self.state_path = state_path
         self.preferred_port = preferred_port
+        self.hud_app_path = hud_app_path
         self.force_browser = force_browser
         self.httpd: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
@@ -365,7 +620,7 @@ class Dashboard:
             def do_GET(self) -> None:  # noqa: N802
                 path = urllib.parse.urlparse(self.path).path
                 if path == "/":
-                    body = DASHBOARD_HTML.encode("utf-8")
+                    body = read_dashboard_html().encode("utf-8")
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Content-Length", str(len(body)))
@@ -376,7 +631,7 @@ class Dashboard:
                     try:
                         body = state_path.read_bytes()
                     except FileNotFoundError:
-                        body = b'{"run_name":"swarm","started_at":"","tasks":[],"totals":{"running":0,"done":0,"pass":0,"fail":0,"tokens":0}}'
+                        body = b'{"run_name":"swarm","identity":"unknown","started_at":"","tasks":[],"totals":{"running":0,"done":0,"pass":0,"fail":0,"tokens":0}}'
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.send_header("Cache-Control", "no-store")
@@ -404,9 +659,9 @@ class Dashboard:
         self.thread.start()
         url = f"http://localhost:{self.port}"
         try:
-            if not self.force_browser and SWARM_HUD_APP_PATH.exists():
+            if not self.force_browser and self.hud_app_path is not None and self.hud_app_path.exists():
                 subprocess.Popen(
-                    ["open", "-a", str(SWARM_HUD_APP_PATH)],
+                    ["open", "-a", str(self.hud_app_path)],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
@@ -426,11 +681,13 @@ class Dashboard:
 
 
 class EvalLogger:
-    def __init__(self) -> None:
+    def __init__(self, config: EvalConfig) -> None:
+        self.config = config
         self._conn: Any | None = None
-        self._fallback_path = JSONL_FALLBACK_PATH
+        self._fallback_path = config.jsonl_path
         self._fallback_reason: str | None = None
-        self._connect()
+        if config.backend == "postgres":
+            self._connect()
 
     def log_attempt(self, row: dict[str, Any]) -> None:
         db_row = dict(row)
@@ -465,7 +722,10 @@ class EvalLogger:
         except Exception as exc:
             self._fallback_reason = f"psycopg import failed: {exc}"
             return
-        creds = parse_supabase_env(SUPABASE_ENV_PATH)
+        if self.config.postgres is None:
+            self._fallback_reason = "postgres eval config missing"
+            return
+        creds = parse_env_file(self.config.postgres.env_file)
         required = [
             "SUPABASE_DB_HOST",
             "SUPABASE_DB_PORT",
@@ -561,11 +821,13 @@ class SwarmRunner:
     def __init__(
         self,
         manifest: Manifest,
+        config: AppConfig,
         identity: str,
         dashboard_enabled: bool = True,
         force_browser: bool = False,
     ) -> None:
         self.manifest = manifest
+        self.config = config
         self.identity = identity
         self.dashboard_enabled = dashboard_enabled
         self.run_id = build_run_id(manifest.run_name)
@@ -583,16 +845,23 @@ class SwarmRunner:
             self.run_id,
             manifest.run_name,
             identity,
+            config.state_dir,
+            config.engines,
             self.started_at,
             self.runtimes,
             self.lock,
         )
         self.dashboard = (
-            Dashboard(state_path=self.state_writer.path, force_browser=force_browser)
+            Dashboard(
+                state_path=self.state_writer.path,
+                preferred_port=config.dashboard_port_base,
+                hud_app_path=config.hud_app_path,
+                force_browser=force_browser,
+            )
             if dashboard_enabled
             else None
         )
-        self.logger = EvalLogger()
+        self.logger = EvalLogger(config.eval)
         self.verifier = Verifier()
         self.semaphore = asyncio.Semaphore(manifest.max_parallel)
         self.active_processes: dict[int, asyncio.subprocess.Process] = {}
@@ -749,19 +1018,35 @@ class SwarmRunner:
 
     async def _run_worker(self, runtime: TaskRuntime, spec: str, attempt: int) -> WorkerResult:
         log_path = runtime.taskdir / "worker.log"
-        cmd = [CODEX_BIN, "exec", "--skip-git-repo-check"]
-        if runtime.task.full_access:
-            # Nested subbies need network: children run under this worker's sandbox.
-            cmd.append("--dangerously-bypass-approvals-and-sandbox")
-        else:
-            # Never rely on the default sandbox: it resolves to read-only in
-            # untrusted dirs (e.g. /tmp), which blocks all artifact writes.
-            cmd += ["--sandbox", "workspace-write"]
-        cmd += ["-C", str(runtime.taskdir), spec]
+        engine = self.config.engines.get(runtime.task.engine)
+        if engine is None:
+            return WorkerResult(
+                returncode=None,
+                timed_out=False,
+                tokens=None,
+                error=f"unknown worker engine: {runtime.task.engine}",
+            )
+        if runtime.task.full_access and not self.config.allow_full_access:
+            return WorkerResult(
+                returncode=None,
+                timed_out=False,
+                tokens=None,
+                error=(
+                    f"task requested full_access with engine {runtime.task.engine}, "
+                    "but config allow_full_access is false"
+                ),
+            )
+        cmd = build_worker_command(
+            engine,
+            taskdir=runtime.taskdir,
+            spec=spec,
+            full_access=runtime.task.full_access,
+        )
         append_text(
             log_path,
             "\n"
             f"[swarm.py] attempt {attempt} started {datetime.now(timezone.utc).isoformat()}\n"
+            f"[swarm.py] engine: {runtime.task.engine}\n"
             f"[swarm.py] command: {shell_command_for_display(cmd)} < /dev/null\n",
         )
         capture = RollingBytes(max_bytes=1_000_000)
@@ -807,7 +1092,7 @@ class SwarmRunner:
                     await reader
             self.active_processes.pop(proc.pid, None)
         output_tail = capture.text()
-        tokens = parse_token_count(output_tail)
+        tokens = parse_token_count(output_tail, engine.token_regex)
         if timed_out:
             append_text(log_path, f"\n[swarm.py] worker timed out after {runtime.task.timeout_s}s\n")
         append_text(log_path, f"[swarm.py] attempt {attempt} exited rc={proc.returncode}\n")
@@ -860,7 +1145,7 @@ class SwarmRunner:
                 "pattern": "swarm-py",
                 "task_key": runtime.task.key,
                 "spec": spec[:500],
-                "worker_engine": WORKER_ENGINE,
+                "worker_engine": runtime.task.engine,
                 "shepherd_model": SHEPHERD_MODEL,
                 "verify_method": VERIFY_METHOD,
                 "verdict": verdict,
@@ -923,14 +1208,19 @@ def build_run_id(run_name: str) -> str:
     return f"{safe_name or 'swarm'}-{stamp}-p{os.getpid()}"
 
 
-def resolve_identity(value: str | None) -> str:
-    for candidate in (value, os.environ.get("FLEET_IDENTITY"), os.environ.get("SWARM_IDENTITY")):
+def resolve_identity(value: str | None, config: AppConfig) -> str:
+    for candidate in (
+        value,
+        os.environ.get("FLEET_IDENTITY"),
+        os.environ.get(f"{ENV_VAR_PREFIX}_IDENTITY"),
+        config.identity_default,
+    ):
         if candidate and candidate.strip():
             return candidate.strip()
-    return socket.gethostname().split(".", 1)[0] or "swarm"
+    return socket.gethostname().split(".", 1)[0] or TOOL_NAME
 
 
-def parse_supabase_env(path: Path) -> dict[str, str]:
+def parse_env_file(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
     values: dict[str, str] = {}
@@ -948,7 +1238,16 @@ def parse_supabase_env(path: Path) -> dict[str, str]:
     return values
 
 
-def parse_token_count(text: str) -> int | None:
+def parse_token_count(text: str, token_regex: str | None = DEFAULT_TOKEN_REGEX) -> int | None:
+    if token_regex:
+        matches = list(re.finditer(token_regex, text, flags=re.IGNORECASE))
+        for match in reversed(matches):
+            groups = [item for item in match.groups() if item]
+            value = groups[0] if groups else match.group(0)
+            number = re.search(r"([0-9][0-9,]*)", value)
+            if number:
+                return int(number.group(1).replace(",", ""))
+        return None
     matches = re.findall(r"tokens\s+used\s*:?\s*([0-9][0-9,]*)", text, flags=re.IGNORECASE)
     if not matches:
         matches = re.findall(
@@ -959,6 +1258,42 @@ def parse_token_count(text: str) -> int | None:
     if not matches:
         return None
     return int(matches[-1].replace(",", ""))
+
+
+def build_worker_command(
+    engine: EngineConfig,
+    *,
+    taskdir: Path,
+    spec: str,
+    full_access: bool,
+) -> list[str]:
+    access_args = engine.full_access_args if full_access else engine.sandbox_args
+    command = [engine.bin]
+    for item in engine.args_template:
+        if item == "{access_args}":
+            command.extend(access_args)
+            continue
+        if item == "{sandbox_args}":
+            command.extend(engine.sandbox_args)
+            continue
+        if item == "{full_access_args}":
+            command.extend(engine.full_access_args)
+            continue
+        command.append(item.replace("{taskdir}", str(taskdir)).replace("{spec}", spec))
+    return command
+
+
+def validate_manifest_engines(manifest: Manifest, config: AppConfig) -> None:
+    missing = sorted({task.engine for task in manifest.tasks if task.engine not in config.engines})
+    if missing:
+        raise ValueError(f"unknown worker engine(s): {', '.join(missing)}")
+
+
+def read_dashboard_html() -> str:
+    try:
+        return DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return MINIMAL_DASHBOARD_HTML
 
 
 def tail_lines(path: Path, line_count: int) -> list[str]:
@@ -1039,27 +1374,60 @@ def shell_command_for_display(parts: Iterable[str]) -> str:
     return " ".join(shlex.quote(part) for part in parts)
 
 
-def dry_run(manifest: Manifest, identity: str, dashboard_enabled: bool, force_browser: bool) -> None:
+def dry_run(
+    manifest: Manifest,
+    config: AppConfig,
+    identity: str,
+    dashboard_enabled: bool,
+    force_browser: bool,
+) -> None:
     print("DRY RUN: no codex workers will be spawned.")
     print(f"Run: {manifest.run_name}")
     print(f"Identity: {identity}")
+    print(f"Config: {config.path if config.path else '(safe defaults)'}")
     print(f"Workdir: {manifest.workdir}")
     print(f"Max parallel: {manifest.max_parallel}")
     print(f"Worktrees: {manifest.worktrees} repo={manifest.repo}")
+    print(f"State dir: {config.state_dir}")
+    print(f"Eval backend: {config.eval.backend}")
     print(f"Dashboard: {'on' if dashboard_enabled else 'off'}")
     if dashboard_enabled:
-        mode = "browser" if force_browser else "SwarmHUD app when available, browser fallback"
+        mode = "browser"
+        if not force_browser and config.hud_app_path is not None:
+            mode = f"HUD app {config.hud_app_path} when available, browser fallback"
         print(f"Dashboard opener: {mode}")
+        print(f"Dashboard port base: {config.dashboard_port_base}")
     print("Tasks:")
     for task in manifest.tasks:
         taskdir = (manifest.workdir / task.key).resolve()
-        cmd = [CODEX_BIN, "exec", "--skip-git-repo-check", "-C", str(taskdir), task.spec]
+        engine = config.engines.get(task.engine)
+        full_access_allowed = task.full_access and config.allow_full_access
+        cmd = (
+            build_worker_command(
+                engine,
+                taskdir=taskdir,
+                spec=task.spec,
+                full_access=task.full_access,
+            )
+            if engine is not None
+            else []
+        )
         print(f"  - {task.key}")
+        print(f"    engine: {task.engine}")
         print(f"    dir: {taskdir}")
         print(f"    timeout_s: {task.timeout_s}")
+        if task.full_access:
+            print(f"    full_access: true allowed={full_access_allowed}")
+        else:
+            print("    full_access: false")
         print(f"    expect_files: {list(task.expect_files)}")
         print(f"    check: {task.check}")
-        print(f"    command: {shell_command_for_display(cmd)} < /dev/null")
+        if engine is None:
+            print("    command: ERROR unknown engine")
+        elif task.full_access and not config.allow_full_access:
+            print("    command: ERROR full_access requires allow_full_access=true in config")
+        else:
+            print(f"    command: {shell_command_for_display(cmd)} < /dev/null")
 
 
 def print_summary(run_id: str, runtimes: list[TaskRuntime]) -> None:
@@ -1115,12 +1483,14 @@ def create_demo_manifest() -> Path:
 
 async def run_manifest(
     manifest: Manifest,
+    config: AppConfig,
     identity: str,
     dashboard_enabled: bool,
     force_browser: bool,
 ) -> int:
     runner = SwarmRunner(
         manifest,
+        config=config,
         identity=identity,
         dashboard_enabled=dashboard_enabled,
         force_browser=force_browser,
@@ -1132,15 +1502,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="swarm.py",
         description=(
-            "Deterministic Codex swarm orchestrator. Runs manifest tasks in parallel, "
+            "Deterministic AI-agent swarm orchestrator. Runs manifest tasks in parallel, "
             "verifies artifacts with executed checks, retries failures once, logs eval rows, "
             "and serves a live dashboard."
         ),
     )
+    parser.add_argument("--config", type=Path, help="path to config.toml (default: XDG config path)")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run_parser = subparsers.add_parser("run", help="run a swarm manifest")
     run_parser.add_argument("manifest", type=Path, help="path to swarm.json")
+    run_parser.add_argument("--config", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     run_parser.add_argument("--max-parallel", type=int, help="override manifest max_parallel")
     run_parser.add_argument("--identity", help="orchestrator identity for HUD state and swarm_runs")
     run_parser.add_argument("--no-dashboard", action="store_true", help="disable live dashboard")
@@ -1148,6 +1520,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--dry-run", action="store_true", help="print the plan without spawning codex")
 
     demo_parser = subparsers.add_parser("demo", help="generate and run a 3-task toy manifest in /tmp")
+    demo_parser.add_argument("--config", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     demo_parser.add_argument("--max-parallel", type=int, help="override demo max_parallel")
     demo_parser.add_argument("--identity", help="orchestrator identity for HUD state and swarm_runs")
     demo_parser.add_argument("--no-dashboard", action="store_true", help="disable live dashboard")
@@ -1160,17 +1533,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        config = AppConfig.load(args.config)
         if args.command == "demo":
             manifest_path = create_demo_manifest()
             print(f"Demo manifest: {manifest_path}")
         else:
             manifest_path = args.manifest
         manifest = Manifest.from_path(manifest_path).with_max_parallel(args.max_parallel)
-        identity = resolve_identity(args.identity)
+        validate_manifest_engines(manifest, config)
+        identity = resolve_identity(args.identity, config)
         dashboard_enabled = not args.no_dashboard
         if args.dry_run:
             dry_run(
                 manifest,
+                config=config,
                 identity=identity,
                 dashboard_enabled=dashboard_enabled,
                 force_browser=args.browser,
@@ -1179,6 +1555,7 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(
             run_manifest(
                 manifest,
+                config=config,
                 identity=identity,
                 dashboard_enabled=dashboard_enabled,
                 force_browser=args.browser,
@@ -1191,397 +1568,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"swarm.py: error: {exc}", file=sys.stderr)
         return 2
 
-
-DASHBOARD_HTML = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>swarm mission control</title>
-<style>
-:root {
-  color-scheme: dark;
-  --bg: #080a0f;
-  --panel: #111722;
-  --panel-2: #151d2b;
-  --line: rgba(255,255,255,.12);
-  --text: #eef4ff;
-  --muted: #8f9db2;
-  --cyan: #28d7ff;
-  --amber: #ffbe45;
-  --green: #49e27d;
-  --red: #ff5468;
-  --gray: #778195;
-}
-* { box-sizing: border-box; }
-html, body { min-height: 100%; }
-body {
-  margin: 0;
-  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background:
-    radial-gradient(circle at 50% -20%, rgba(40,215,255,.16), transparent 34rem),
-    linear-gradient(180deg, #080a0f 0%, #0d1119 60%, #080a0f 100%);
-  color: var(--text);
-  overflow-x: hidden;
-}
-body:before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  background-image:
-    linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px);
-  background-size: 48px 48px;
-  mask-image: linear-gradient(180deg, rgba(0,0,0,.9), transparent);
-}
-.shell { width: min(1440px, calc(100% - 32px)); margin: 0 auto; padding: 24px 0 96px; }
-.topbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 18px 0 22px;
-  border-bottom: 1px solid var(--line);
-}
-.brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
-.pulse {
-  width: 13px;
-  height: 13px;
-  border-radius: 50%;
-  background: var(--cyan);
-  box-shadow: 0 0 0 0 rgba(40,215,255,.7), 0 0 28px rgba(40,215,255,.9);
-  animation: pulse 1.4s infinite;
-  flex: 0 0 auto;
-}
-h1 {
-  margin: 0;
-  font-size: clamp(22px, 3vw, 42px);
-  line-height: 1;
-  letter-spacing: 0;
-  text-transform: uppercase;
-  overflow-wrap: anywhere;
-}
-.meta {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 13px;
-  text-align: right;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-.grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 14px;
-  padding-top: 18px;
-}
-.card {
-  position: relative;
-  min-height: 210px;
-  padding: 16px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: linear-gradient(180deg, rgba(21,29,43,.92), rgba(11,15,23,.96));
-  overflow: hidden;
-  transition: border-color .25s ease, transform .25s ease, box-shadow .25s ease;
-}
-.card.running, .card.retrying {
-  border-color: rgba(40,215,255,.45);
-  box-shadow: 0 0 38px rgba(40,215,255,.12);
-}
-.card.pass { border-color: rgba(73,226,125,.46); }
-.card.fail { border-color: rgba(255,84,104,.54); }
-.card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
-.key {
-  min-width: 0;
-  font-size: 19px;
-  font-weight: 800;
-  overflow-wrap: anywhere;
-}
-.chip {
-  flex: 0 0 auto;
-  border-radius: 999px;
-  padding: 5px 9px;
-  font-size: 11px;
-  font-weight: 800;
-  line-height: 1;
-  color: #080a0f;
-  background: var(--gray);
-  text-transform: uppercase;
-}
-.chip.running {
-  background: var(--cyan);
-  animation: glow 1.2s infinite alternate;
-}
-.chip.retrying {
-  background: var(--cyan);
-  animation: glow 650ms infinite alternate;
-}
-.chip.verifying { background: var(--amber); }
-.chip.pass { background: var(--green); }
-.chip.fail { background: var(--red); }
-.spec {
-  margin: 12px 0 16px;
-  color: #c7d2e5;
-  font-size: 13px;
-  line-height: 1.35;
-  min-height: 36px;
-  overflow-wrap: anywhere;
-}
-.metrics {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-  margin-bottom: 14px;
-}
-.metric {
-  border: 1px solid rgba(255,255,255,.08);
-  background: rgba(255,255,255,.035);
-  border-radius: 8px;
-  padding: 8px;
-  min-width: 0;
-}
-.label {
-  color: var(--muted);
-  text-transform: uppercase;
-  font-size: 10px;
-  font-weight: 800;
-  margin-bottom: 4px;
-}
-.value {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 15px;
-  overflow-wrap: anywhere;
-}
-.subbies {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  min-height: 24px;
-  padding: 4px 8px;
-  border-radius: 999px;
-  border: 1px solid rgba(40,215,255,.34);
-  background: rgba(40,215,255,.1);
-  color: #b9f3ff;
-  font-size: 12px;
-  font-weight: 800;
-  opacity: 0;
-  transform: translateY(4px);
-  transition: opacity .2s ease, transform .2s ease;
-}
-.subbies.on { opacity: 1; transform: translateY(0); }
-.log {
-  position: absolute;
-  left: 16px;
-  right: 16px;
-  bottom: 16px;
-  min-height: 38px;
-  max-height: 38px;
-  overflow: hidden;
-  color: #d8e3f4;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px;
-  line-height: 1.35;
-  opacity: .72;
-  transition: opacity .25s ease, transform .25s ease;
-}
-.log.flash { opacity: 1; transform: translateY(-2px); }
-.shimmer {
-  position: absolute;
-  inset: auto 0 0 0;
-  height: 3px;
-  opacity: 0;
-  background: linear-gradient(90deg, transparent, rgba(40,215,255,.92), transparent);
-  transform: translateX(-100%);
-  animation: sweep 1.3s linear infinite;
-  transition: opacity .2s ease;
-}
-.footer {
-  position: fixed;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  border-top: 1px solid var(--line);
-  background: rgba(8,10,15,.9);
-  backdrop-filter: blur(14px);
-}
-.footer-inner {
-  width: min(1440px, calc(100% - 32px));
-  margin: 0 auto;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 12px 0;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  color: #cdd8ea;
-  font-size: 13px;
-  flex-wrap: wrap;
-}
-.totals { display: flex; gap: 14px; flex-wrap: wrap; }
-.totals b { color: var(--text); }
-@keyframes pulse {
-  0% { box-shadow: 0 0 0 0 rgba(40,215,255,.62), 0 0 28px rgba(40,215,255,.9); }
-  70% { box-shadow: 0 0 0 14px rgba(40,215,255,0), 0 0 28px rgba(40,215,255,.9); }
-  100% { box-shadow: 0 0 0 0 rgba(40,215,255,0), 0 0 28px rgba(40,215,255,.9); }
-}
-@keyframes glow {
-  from { box-shadow: 0 0 8px rgba(40,215,255,.2); }
-  to { box-shadow: 0 0 20px rgba(40,215,255,.85); }
-}
-@keyframes sweep {
-  to { transform: translateX(100%); }
-}
-@media (max-width: 640px) {
-  .shell { width: min(100% - 20px, 640px); padding-top: 12px; }
-  .topbar { align-items: flex-start; flex-direction: column; }
-  .grid { grid-template-columns: 1fr; }
-  .metrics { grid-template-columns: 1fr 1fr; }
-}
-</style>
-</head>
-<body>
-<div class="shell">
-  <header class="topbar">
-    <div class="brand"><span class="pulse"></span><h1 id="runName">swarm</h1></div>
-    <div class="meta"><span id="startedAt">booting</span><span id="topElapsed">00:00</span></div>
-  </header>
-  <main id="grid" class="grid"></main>
-</div>
-<footer class="footer">
-  <div class="footer-inner">
-    <div class="totals">
-      <span>running <b id="totalRunning">0</b></span>
-      <span>done <b id="totalDone">0</b></span>
-      <span>pass <b id="totalPass">0</b></span>
-      <span>fail <b id="totalFail">0</b></span>
-    </div>
-    <div>token burn <b id="totalTokens">0</b> / elapsed <b id="elapsed">00:00</b></div>
-  </div>
-</footer>
-<script>
-const grid = document.getElementById("grid");
-const cards = new Map();
-let startedAt = null;
-let displayedTokens = 0;
-
-function fmtElapsed(seconds) {
-  seconds = Math.max(0, Math.floor(seconds || 0));
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-}
-
-function makeCard(key) {
-  const card = document.createElement("section");
-  card.className = "card queued";
-  card.innerHTML = `
-    <div class="card-head">
-      <div class="key"></div>
-      <div class="chip queued">queued</div>
-    </div>
-    <div class="spec"></div>
-    <div class="metrics">
-      <div class="metric"><div class="label">elapsed</div><div class="value elapsed">00:00</div></div>
-      <div class="metric"><div class="label">tokens</div><div class="value tokens">0</div></div>
-      <div class="metric"><div class="label">subbies</div><div class="value childCount">0</div></div>
-    </div>
-    <div class="subbies"></div>
-    <div class="log"></div>
-    <div class="shimmer"></div>
-  `;
-  card.querySelector(".key").textContent = key;
-  grid.appendChild(card);
-  return card;
-}
-
-function updateCard(task) {
-  const key = task.key || "task";
-  const card = cards.get(key) || makeCard(key);
-  cards.set(key, card);
-  const status = task.status || "queued";
-  card.className = `card ${status}`;
-  const chip = card.querySelector(".chip");
-  chip.className = `chip ${status}`;
-  chip.textContent = status;
-  card.querySelector(".spec").textContent = task.spec_short || "";
-  card.querySelector(".elapsed").textContent = fmtElapsed(task.elapsed_s);
-  card.querySelector(".tokens").textContent = (task.tokens || 0).toLocaleString();
-  card.querySelector(".childCount").textContent = task.children || 0;
-  const badge = card.querySelector(".subbies");
-  if ((task.children || 0) > 0) {
-    badge.textContent = `${String.fromCharCode(10551)} ${task.children} subbies`;
-    badge.classList.add("on");
-  } else {
-    badge.textContent = "";
-    badge.classList.remove("on");
-  }
-  const shimmer = card.querySelector(".shimmer");
-  shimmer.style.opacity = status === "running" || status === "retrying" ? "1" : "0";
-  const log = card.querySelector(".log");
-  const lastLine = (task.log_tail || []).slice(-1)[0] || "";
-  if (log.textContent !== lastLine) {
-    log.textContent = lastLine;
-    log.classList.remove("flash");
-    void log.offsetWidth;
-    log.classList.add("flash");
-  }
-}
-
-function animateTokens(target) {
-  target = target || 0;
-  const start = displayedTokens;
-  const delta = target - start;
-  const startTime = performance.now();
-  function step(now) {
-    const t = Math.min(1, (now - startTime) / 450);
-    displayedTokens = Math.round(start + delta * (1 - Math.pow(1 - t, 3)));
-    document.getElementById("totalTokens").textContent = displayedTokens.toLocaleString();
-    if (t < 1) requestAnimationFrame(step);
-  }
-  requestAnimationFrame(step);
-}
-
-function updateElapsed() {
-  if (!startedAt) return;
-  const seconds = (Date.now() - startedAt.getTime()) / 1000;
-  document.getElementById("elapsed").textContent = fmtElapsed(seconds);
-  document.getElementById("topElapsed").textContent = fmtElapsed(seconds);
-}
-
-async function poll() {
-  try {
-    const response = await fetch(`/state.json?t=${Date.now()}`, { cache: "no-store" });
-    const state = await response.json();
-    document.getElementById("runName").textContent = state.run_name || "swarm";
-    startedAt = state.started_at ? new Date(state.started_at) : startedAt;
-    document.getElementById("startedAt").textContent = startedAt ? startedAt.toLocaleString() : "";
-    (state.tasks || []).forEach(updateCard);
-    const totals = state.totals || {};
-    document.getElementById("totalRunning").textContent = totals.running || 0;
-    document.getElementById("totalDone").textContent = totals.done || 0;
-    document.getElementById("totalPass").textContent = totals.pass || 0;
-    document.getElementById("totalFail").textContent = totals.fail || 0;
-    animateTokens(totals.tokens || 0);
-    updateElapsed();
-  } catch (err) {
-    console.error(err);
-  }
-}
-
-setInterval(poll, 1000);
-setInterval(updateElapsed, 250);
-poll();
-</script>
-</body>
-</html>
-"""
 
 
 if __name__ == "__main__":

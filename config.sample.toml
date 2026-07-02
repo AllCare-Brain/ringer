@@ -1,0 +1,74 @@
+# Sample config for swarm.py.
+# Copy to ~/.config/swarm/config.toml or pass with --config /path/to/config.toml.
+
+# Default identity stamped into state JSON and eval rows when --identity and env vars
+# are not set. Leave unset for the public fallback: short hostname.
+# identity_default = "codex-mini"
+
+# State files live under <state_dir>/runs/<run_id>.json.
+state_dir = "~/.swarm"
+
+# First localhost port tried for the per-run dashboard. The server will scan the
+# next 49 ports if this one is busy.
+dashboard_port_base = 8787
+
+# Optional native HUD app path. Public installs should omit this and let the
+# dashboard open in the browser.
+# hud_app_path = "/Applications/SwarmHUD.app"
+
+# Belt-and-suspenders full-access gate. A task with "full_access": true will
+# still fail unless this is true.
+allow_full_access = false
+
+[eval]
+# Safe public default: write one JSON object per attempt to a local JSONL file.
+# Use "postgres" only when [eval.postgres] is configured.
+backend = "jsonl"
+jsonl_path = "~/.swarm/runs.jsonl"
+
+# Optional Supabase/Postgres logging. The env file should define:
+# SUPABASE_DB_HOST, SUPABASE_DB_PORT, SUPABASE_DB_USER,
+# SUPABASE_DB_PASSWORD, SUPABASE_DB_NAME.
+# [eval.postgres]
+# env_file = "~/.supabase.env"
+
+[engines.codex]
+# Public default resolves this with shutil.which("codex"). Set an absolute path
+# here only for machine-specific installs.
+bin = "codex"
+
+# Placeholders:
+# - {taskdir}: task working directory
+# - {spec}: task prompt/spec
+# - {access_args}: expands to sandbox_args or full_access_args
+args_template = [
+  "exec",
+  "--skip-git-repo-check",
+  "{access_args}",
+  "-C",
+  "{taskdir}",
+  "{spec}",
+]
+
+# Never rely on an engine's default sandbox. Be explicit.
+sandbox_args = ["--sandbox", "workspace-write"]
+full_access_args = ["--dangerously-bypass-approvals-and-sandbox"]
+
+# First capture group should be the integer token count.
+token_regex = "tokens\\s+used\\s*:?\\s*([0-9][0-9,]*)"
+
+# Example: Grok CLI. Adjust flags to whatever your installed CLI actually uses.
+# [engines.grok]
+# bin = "grok"
+# args_template = ["run", "--cwd", "{taskdir}", "{spec}"]
+# sandbox_args = []
+# full_access_args = ["--dangerous"]
+# token_regex = "tokens\\s*:?\\s*([0-9][0-9,]*)"
+
+# Example: OpenCode. Adjust for your local opencode version.
+# [engines.opencode]
+# bin = "opencode"
+# args_template = ["run", "--cwd", "{taskdir}", "{spec}"]
+# sandbox_args = []
+# full_access_args = ["--allow-all"]
+# token_regex = "tokens\\s*:?\\s*([0-9][0-9,]*)"

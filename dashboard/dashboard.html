@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>swarm mission control</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #080a0f;
+      --panel: #111722;
+      --panel-2: #151d2b;
+      --line: rgba(255,255,255,.12);
+      --text: #eef4ff;
+      --muted: #8f9db2;
+      --cyan: #28d7ff;
+      --amber: #ffbe45;
+      --green: #49e27d;
+      --red: #ff5468;
+      --gray: #778195;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      min-height: 100%;
+      margin: 0;
+      background:
+        radial-gradient(circle at 50% -20%, rgba(40,215,255,.14), transparent 28rem),
+        linear-gradient(180deg, #080a0f 0%, #0d1119 60%, #080a0f 100%);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      overflow-x: hidden;
+    }
+    body:before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px);
+      background-size: 42px 42px;
+      mask-image: linear-gradient(180deg, rgba(0,0,0,.86), transparent);
+    }
+    .shell {
+      position: relative;
+      z-index: 1;
+      width: min(1160px, calc(100% - 24px));
+      margin: 0 auto;
+      padding: 18px 0 28px;
+    }
+    .topbar {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      padding: 12px 0 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .top-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: var(--gray);
+      box-shadow: 0 0 16px rgba(119,129,149,.7);
+    }
+    .top-dot.live {
+      background: var(--cyan);
+      animation: dotPulse 1.35s infinite;
+    }
+    .top-dot.pass { background: var(--green); box-shadow: 0 0 18px rgba(73,226,125,.72); }
+    .top-dot.fail { background: var(--red); box-shadow: 0 0 18px rgba(255,84,104,.78); }
+    .title {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    h1 {
+      margin: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: clamp(19px, 2.2vw, 30px);
+      line-height: 1;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+    .subtitle, .clock {
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    #app {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding-top: 14px;
+    }
+    .empty {
+      min-height: calc(100vh - 110px);
+      display: grid;
+      place-items: center;
+      color: rgba(230,240,255,.72);
+      font-size: 13px;
+      animation: emptyPulse 1.8s ease-in-out infinite;
+    }
+    .run {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: linear-gradient(180deg, rgba(21,29,43,.92), rgba(11,15,23,.96));
+      overflow: hidden;
+      transition: opacity .2s ease, border-color .2s ease, box-shadow .2s ease;
+    }
+    .run.live {
+      border-color: rgba(40,215,255,.42);
+      box-shadow: 0 0 34px rgba(40,215,255,.10);
+    }
+    .run.finished { opacity: .74; }
+    .run.died {
+      border-color: rgba(255,84,104,.58);
+      background: linear-gradient(180deg, rgba(46,18,25,.92), rgba(14,10,14,.96));
+    }
+    .run-head {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 9px;
+      align-items: center;
+      padding: 11px 12px 9px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--gray);
+      box-shadow: 0 0 16px rgba(119,129,149,.7);
+    }
+    .dot.live {
+      background: var(--cyan);
+      animation: dotPulse 1.35s infinite;
+    }
+    .dot.finished { background: var(--green); }
+    .dot.died { background: var(--red); box-shadow: 0 0 18px rgba(255,84,104,.78); }
+    .run-main {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .run-name {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 14px;
+      font-weight: 800;
+      letter-spacing: 0;
+    }
+    .identity {
+      flex: 0 0 auto;
+      max-width: 132px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      border-radius: 999px;
+      padding: 3px 7px;
+      background: color-mix(in srgb, var(--identity) 22%, transparent);
+      border: 1px solid color-mix(in srgb, var(--identity) 70%, transparent);
+      color: #ecf8ff;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 10px;
+      font-weight: 800;
+    }
+    .run-meta {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 2px;
+      color: #cbd6e8;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      line-height: 1.18;
+    }
+    .final { color: var(--muted); }
+    .tasks {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(136px, 1fr));
+      gap: 8px;
+      padding: 10px;
+    }
+    .task {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 4px 6px;
+      align-items: center;
+      border: 1px solid rgba(255,255,255,.08);
+      border-left: 3px solid var(--gray);
+      border-radius: 7px;
+      background: rgba(255,255,255,.035);
+      padding: 7px;
+    }
+    .task.running, .task.retrying { border-left-color: var(--cyan); }
+    .task.verifying { border-left-color: var(--amber); }
+    .task.pass { border-left-color: var(--green); }
+    .task.fail { border-left-color: var(--red); }
+    .task-key {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .task-status {
+      border-radius: 999px;
+      padding: 3px 5px;
+      background: var(--gray);
+      color: #080a0f;
+      font-size: 9px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+    .task.running .task-status, .task.retrying .task-status { background: var(--cyan); }
+    .task.verifying .task-status { background: var(--amber); }
+    .task.pass .task-status { background: var(--green); }
+    .task.fail .task-status { background: var(--red); }
+    .task-elapsed, .children {
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 10px;
+    }
+    .children {
+      text-align: right;
+      color: #b9f3ff;
+      font-weight: 800;
+    }
+    @keyframes dotPulse {
+      0% { box-shadow: 0 0 0 0 rgba(40,215,255,.62), 0 0 24px rgba(40,215,255,.86); }
+      70% { box-shadow: 0 0 0 12px rgba(40,215,255,0), 0 0 24px rgba(40,215,255,.86); }
+      100% { box-shadow: 0 0 0 0 rgba(40,215,255,0), 0 0 24px rgba(40,215,255,.86); }
+    }
+    @keyframes emptyPulse {
+      0%, 100% { opacity: .38; transform: scale(.985); }
+      50% { opacity: .90; transform: scale(1); }
+    }
+    @media (max-width: 640px) {
+      .shell { width: min(100% - 18px, 640px); padding-top: 10px; }
+      .topbar { grid-template-columns: auto minmax(0, 1fr); }
+      .clock { grid-column: 2; }
+      .tasks { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <span id="topDot" class="top-dot"></span>
+      <div class="title">
+        <h1 id="headline">swarm mission control</h1>
+        <div id="subtitle" class="subtitle">no swarms running</div>
+      </div>
+      <div id="clock" class="clock">00:00</div>
+    </header>
+    <main id="app"><div class="empty">no swarms running</div></main>
+  </div>
+  <script>
+    const app = document.getElementById("app");
+    const headline = document.getElementById("headline");
+    const subtitle = document.getElementById("subtitle");
+    const topDot = document.getElementById("topDot");
+    const clock = document.getElementById("clock");
+    const htmlEscapes = {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"};
+    let currentRuns = [];
+
+    function escapeHTML(value) {
+      return String(value ?? "").replace(/[&<>"']/g, char => htmlEscapes[char]);
+    }
+
+    function identityColor(name) {
+      let hash = 2166136261;
+      const text = String(name || "unknown");
+      for (let i = 0; i < text.length; i++) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+      const hue = (hash >>> 0) % 360;
+      return `hsl(${hue} 78% 58%)`;
+    }
+
+    function fmtElapsed(seconds) {
+      seconds = Math.max(0, Math.floor(seconds || 0));
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = seconds % 60;
+      if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+      return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    }
+
+    function elapsedFromStart(run) {
+      const current = Number(run.elapsed_s);
+      if (run.state && run.state !== "live" && Number.isFinite(current)) return current;
+      if (!run.started_at) return 0;
+      const started = Date.parse(run.started_at);
+      if (!Number.isFinite(started)) return Number.isFinite(current) ? current : 0;
+      return Math.max(Number.isFinite(current) ? current : 0, (Date.now() - started) / 1000);
+    }
+
+    function normalizePayload(payload) {
+      const rawRuns = Array.isArray(payload) ? payload : (payload?.runs || [payload]);
+      return rawRuns.filter(Boolean).map(run => {
+        const totals = run.totals || {};
+        const summary = run.summary || {};
+        const state = run.state || (run.finished ? "finished" : "live");
+        const pass = Number(run.pass ?? summary.pass ?? totals.pass ?? 0);
+        const fail = Number(run.fail ?? summary.fail ?? totals.fail ?? 0);
+        const tokens = Number(run.tokens ?? summary.tokens ?? totals.tokens ?? 0);
+        return {
+          ...run,
+          state,
+          identity: run.identity || "unknown",
+          run_name: run.run_name || "swarm",
+          elapsed_s: elapsedFromStart(run),
+          pass,
+          fail,
+          tokens,
+          tasks: Array.isArray(run.tasks) ? run.tasks : []
+        };
+      }).sort((left, right) => {
+        const rank = {live: 0, finished: 1, died: 2};
+        const leftRank = rank[left.state] ?? 3;
+        const rightRank = rank[right.state] ?? 3;
+        if (leftRank !== rightRank) return leftRank - rightRank;
+        return Date.parse(right.started_at || 0) - Date.parse(left.started_at || 0);
+      });
+    }
+
+    function renderTask(task) {
+      const status = task.status || "queued";
+      const children = Number(task.children || 0);
+      const engine = task.engine ? ` / ${escapeHTML(task.engine)}` : "";
+      return `
+        <div class="task ${escapeHTML(status)}">
+          <div class="task-key" title="${escapeHTML(task.key)}${engine}">${escapeHTML(task.key || "task")}</div>
+          <div class="task-status">${escapeHTML(status)}</div>
+          <div class="task-elapsed">${fmtElapsed(task.elapsed_s)}</div>
+          <div class="children">${children > 0 ? `&#10551;${children}` : ""}</div>
+        </div>
+      `;
+    }
+
+    function renderRun(run) {
+      const identity = run.identity || "unknown";
+      const final = run.state === "finished"
+        ? `<span class="final">&check;${run.pass} &cross;${run.fail}</span>`
+        : (run.state === "died" ? `<span class="final">died</span>` : "");
+      const tasks = run.tasks.map(renderTask).join("");
+      return `
+        <section class="run ${escapeHTML(run.state)}">
+          <header class="run-head">
+            <span class="dot ${escapeHTML(run.state)}"></span>
+            <div class="run-main">
+              <div class="run-name" title="${escapeHTML(run.run_name)}">${escapeHTML(run.run_name || "swarm")}</div>
+              <span class="identity" style="--identity:${identityColor(identity)}" title="${escapeHTML(identity)}">${escapeHTML(identity)}</span>
+            </div>
+            <div class="run-meta">
+              <span>${fmtElapsed(run.elapsed_s)}</span>
+              <span>${Number(run.tokens || 0).toLocaleString()} tok</span>
+              ${final}
+            </div>
+          </header>
+          <div class="tasks">${tasks || `<div class="task"><div class="task-key">no tasks</div><div class="task-status">idle</div><div class="task-elapsed">00:00</div><div></div></div>`}</div>
+        </section>
+      `;
+    }
+
+    function updateTopbar(runs) {
+      const liveRuns = runs.filter(run => run.state === "live");
+      const anyFailure = runs.some(run => run.state === "died" || Number(run.fail || 0) > 0);
+      const newest = runs[0];
+      let dotClass = "";
+      if (anyFailure) dotClass = "fail";
+      else if (liveRuns.length > 0) dotClass = "live";
+      else if (newest && newest.state === "finished" && Number(newest.pass || 0) > 0) dotClass = "pass";
+      topDot.className = `top-dot ${dotClass}`;
+
+      if (liveRuns.length > 1) {
+        const agents = liveRuns.reduce((sum, run) => sum + (run.tasks || []).length, 0);
+        headline.textContent = `${liveRuns.length} swarms`;
+        subtitle.textContent = `${agents} agents`;
+      } else if (liveRuns.length === 1) {
+        headline.textContent = liveRuns[0].run_name || "swarm";
+        subtitle.textContent = liveRuns[0].identity || "unknown";
+      } else if (newest) {
+        headline.textContent = newest.state === "died" ? `${newest.run_name || "swarm"} died` : (newest.run_name || "swarm");
+        subtitle.textContent = `${runs.length} swarm${runs.length === 1 ? "" : "s"}`;
+      } else {
+        headline.textContent = "swarm mission control";
+        subtitle.textContent = "no swarms running";
+      }
+      const maxElapsed = runs.reduce((max, run) => Math.max(max, Number(run.elapsed_s || 0)), 0);
+      clock.textContent = fmtElapsed(maxElapsed);
+    }
+
+    function update(payload) {
+      currentRuns = normalizePayload(payload);
+      updateTopbar(currentRuns);
+      if (currentRuns.length === 0) {
+        app.innerHTML = `<div class="empty">no swarms running</div>`;
+        return;
+      }
+      app.innerHTML = currentRuns.map(renderRun).join("");
+    }
+
+    async function pollLocalState() {
+      try {
+        const response = await fetch(`/state.json?t=${Date.now()}`, {cache: "no-store"});
+        if (!response.ok) return;
+        const state = await response.json();
+        update(Array.isArray(state) ? state : [state]);
+      } catch (_err) {
+      }
+    }
+
+    setInterval(() => update(currentRuns), 250);
+    setInterval(pollLocalState, 1000);
+    pollLocalState();
+  </script>
+</body>
+</html>

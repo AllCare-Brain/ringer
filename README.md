@@ -74,6 +74,8 @@ Each task gets its own directory, its own worker, its own log, and its own verdi
 
 ## Engines are pluggable
 
+![Identical workers, each under its own light](docs/engines.png)
+
 Codex is built in. Anything with a headless CLI is a config block away:
 
 ```toml
@@ -99,6 +101,8 @@ The bundle lands in `hud/target/release/bundle/`. Ringer auto-opens Ringside whe
 
 ## The eval loop
 
+![Timed, verified, logged](docs/eval-loop.png)
+
 Every worker attempt — pass, fail, timeout, retry — is logged with its spec, engine, duration, token count, and the raw check output. Local JSONL by default; point `[eval.postgres]` at a database to aggregate across machines. Failure rows are the point: they tell you which spec styles, engines, and task shapes actually work, so the swarm gets better on evidence instead of vibes.
 
 ## Hard-won invariants
@@ -119,6 +123,8 @@ Four rules are baked into every worker invocation. They all cost us real debuggi
 - Python 3.11+ (stdlib only; `psycopg` needed only for the optional Postgres eval backend)
 - At least one agent CLI (Codex works out of the box)
 - Rust toolchain, only if you're building Ringside from source
+
+![Between rounds](docs/between-rounds.png)
 
 ---
 

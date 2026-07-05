@@ -1,44 +1,63 @@
 ---
 name: ringer
 description: >-
-  Orchestrator playbook for Ringer, the verified-swarm delegation tool
-  (ringer.py). Use whenever you are about to delegate work to parallel CLI
-  workers, write or review a Ringer manifest, choose a swarm pattern
-  (review swarm, fix swarm, focus group, model bakeoff, research-with-proof),
-  pick a worker engine, or debug a failed run. Also use for single delegated
-  tasks — a single task is just a one-task manifest.
+  Orchestrator playbook and routing rules for Ringer, the verified-swarm
+  delegation tool (ringer.py). TRIGGER — load BEFORE acting, not after —
+  whenever: you are about to run ANY script or command that calls a model or
+  drives a conversational/eval harness (probe, smoke test, simulation,
+  grader, persona conversation) outside a live Ringer run; you are about to
+  start an edit→test→edit loop or a batch of similar edits across files; you
+  are about to do a "quick check" that spawns a model or a CLI agent; you are
+  reviewing or diagnosing failed worker or model output; you catch yourself
+  thinking a task is "small enough to just do myself" — that thought IS the
+  trigger (a single task is a one-task manifest); or you are writing or
+  reviewing a manifest, choosing a swarm pattern (review swarm, fix swarm,
+  focus group, bakeoff, research-with-proof), picking a worker engine, or
+  debugging a failed run. SKIP only for: reading or searching files, git
+  operations, a one-file few-line ONE-SHOT edit (once — if you are back for a
+  second pass, that is a loop: TRIGGER), authoring prose/specs/docs straight
+  from your own context, or pure conversation.
 ---
 
 # Ringer orchestrator playbook
 
+## Read this first — the four rules that actually get broken
+
+1. **You review; workers type.** Your lane: specs, checks, pattern choice,
+   reading results. If you are typing implementation, running probes, or
+   babysitting a retry loop yourself, you have left your lane.
+2. **A single task is a one-task manifest.** Same verification, zero
+   ceremony. "Too small for Ringer" is how drift starts — the smoke test,
+   the probe script, the three-edit fix are all one-task manifests.
+3. **Beware the tiny-edit death spiral.** The named anti-pattern: each step
+   is individually small enough to justify inline, and two hours later the
+   exception has become the workflow and nothing was verified or visible.
+   The one-shot exception is ONE file, a few lines, ONCE. The second pass on
+   the same problem is a loop, and loops are manifests.
+4. **Runs are watched, not hidden.** Never pass `--no-dashboard`: Ringside
+   is the product surface and the human's window into the swarm. Suppressing
+   it turns delegation into invisible work — the exact failure Ringer
+   exists to prevent. Only suppress when the user explicitly asks.
+
 Ringer runs manifest tasks in parallel across cheap CLI workers (Codex,
 OpenCode/GLM, others via config) and verifies every task by **executing a
-check command** — exit 0 is the only PASS. Failed tasks are retried once with
-the check's actual failure output injected into the retry prompt. You — the
-orchestrating model — pay tokens only for specs, orchestration, and review.
+check command** — exit 0 is the only PASS. Failed tasks are retried once
+with the check's actual failure output injected into the retry prompt. You —
+the orchestrating model — pay tokens only for specs, orchestration, and
+review.
 
 ```bash
+./ringer.py lint manifest.json            # always lint before running
 ./ringer.py run manifest.json --identity <who-you-are>
-./ringer.py demo          # 3-worker smoke test
+./ringer.py demo                          # 3-worker smoke test
 ./ringer.py run manifest.json --dry-run   # print the plan, spawn nothing
-./ringer.py lint manifest.json            # check the manifest for swarm-craft mistakes
 ```
-
-Always lint before running: it catches unverifiable checks, silent checks,
-worktree deliverable/commit loss, serial fan-out, write collisions, and
-underspecified specs. `run` prints the same findings as non-blocking
-warnings, but fixing them before spawning workers is cheaper.
 
 Runs land in `~/.ringer/runs/`. Raw worker logs land in `<workdir>/logs/`.
 Full reference: `README.md`. Ready-made manifest skeletons: `templates/`.
-
-## Division of labor (non-negotiable)
-
-**You review; workers type.** Your jobs: write specs, design checks, pick the
-pattern, read the results. Never hand-implement a batch that should be a
-manifest, and never trust a worker's "done" — a task is done when its check
-passed AND you have read the check output and skimmed the raw log for the
-tasks that matter.
+Lint catches unverifiable checks, silent checks, worktree deliverable/commit
+loss, serial fan-out, write collisions, and underspecified specs; `run`
+prints the same findings as non-blocking warnings.
 
 ## Spec-writing craft
 
@@ -102,8 +121,11 @@ Pattern-selection judgment:
 - **Iterating on a prompt/product? Re-run the same panel.** A fixed persona
   panel across rounds tells you whether a change fixed what the panel
   actually complained about.
-- **A single task is a one-task manifest.** Same verification, zero ceremony.
-  Don't skip Ringer because the job is small.
+- **Probes, smokes, and diagnosis loops are manifests too.** A model-calling
+  smoke test is a one-task manifest with the transcript as `expect_files`
+  and a validator as the check. Diagnosing a failed worker's output is a
+  read-only scout task. If it calls a model, it runs under Ringer — that is
+  what makes it visible, verified, and logged.
 
 ## Engine selection
 

@@ -14,8 +14,8 @@ default_model_key = "gpt-5.5"
 
 [engines.codex.models."gpt-5.5"]
 display = "GPT-5.5"
-confidence = "unverified"   # Jon's belief 2026-07-06; capability research to confirm + cite
-source = ""
+confidence = "verified"     # snapshot gpt-5.5-2026-04-23, Codex CLI default; see capability file
+source = "https://developers.openai.com/codex/models"
 
 [engines.grok]
 harness = "Grok Build CLI"
@@ -27,14 +27,14 @@ default_model_key = "grok-build"
 # grok-build alias is unnamed by xAI in our data — capability research task
 # caps-grok is establishing the true lineage with citations. Until then the
 # display shows the alias explicitly rather than harness branding.
-display = "Grok (grok-build alias)"
-confidence = "unverified"
-source = ""
+display = "Grok Build 0.1"
+confidence = "verified"     # xAI overloads the brand: the CLI is the harness, "Grok Build 0.1" is the MODEL with its own official model page
+source = "https://docs.x.ai/developers/release-notes"
 
 [engines.grok.models."grok-composer-2.5-fast"]
 display = "Composer 2.5 Fast"
-confidence = "unverified"
-source = ""
+confidence = "verified"     # Cursor (Anysphere) model, served through xAI's Grok Build CLI in our setup
+source = "https://cursor.com/blog/composer-2-5"
 
 [engines.opencode]
 harness = "OpenCode"

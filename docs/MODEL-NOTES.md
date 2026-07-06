@@ -1,9 +1,11 @@
 # Model notes — how workers actually perform
 
 A running log of how models perform on real Ringer tasks, so engine and
-model choices are made on evidence instead of vibes. The eval log
-(`~/.ringer/runs.jsonl` / the `swarm_runs` table) holds the raw numbers;
-this file holds the judgment.
+model choices are made on evidence instead of vibes. The raw numbers now
+live in the local eval log (`~/.ringer/runs.jsonl`); run `./ringer.py models`
+to print the per-model, per-task_type scoreboard (tasks, attempts,
+pass_rate, first_try_pass_rate, median duration/tokens, last_seen). This
+file remains the judgment layer on top of those numbers.
 
 **How to add a row:** after reviewing a run (post-run ritual step 5 in the
 ringer skill), append one dated line under the model. Say the task type,

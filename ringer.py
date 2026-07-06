@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import json
 import mimetypes
@@ -51,8 +52,11 @@ ACTIVITY_TAIL_BYTES = 2048
 ACTIVITY_TEXT_LIMIT = 80
 ARTIFACT_WRAPPER_TAIL_BYTES = 256 * 1024
 ARTIFACT_LIBRARY_MAX_VERSIONS = 20
+DELIVERABLE_MAX_BYTES = 20 * 1024 * 1024
 WORKER_LOG_TAIL_BYTES = 64 * 1024
 TASK_REPORT_FILENAMES = ("report.md", "report.html")
+TEXT_DELIVERABLE_SUFFIXES = {".md", ".txt", ".log"}
+IMAGE_DELIVERABLE_SUFFIXES = {".avif", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
 SHEPHERD_MODEL = f"none ({TOOL_NAME}.py)"
 VERIFY_METHOD = "executed-check"
 CSP_META_TAG = (
@@ -713,6 +717,8 @@ class TaskRuntime:
     taskdir: Path
     log_path: Path
     report_paths: dict[str, Path] = field(default_factory=dict)
+    deliverables: list[dict[str, Any]] = field(default_factory=list)
+    deliverable_notes: list[str] = field(default_factory=list)
     status: str = "queued"
     spec_short: str = ""
     attempts: int = 0
@@ -916,6 +922,8 @@ class StateWriter:
                         "report_paths": {
                             name: str(path) for name, path in runtime.report_paths.items()
                         },
+                        "deliverables": [dict(item) for item in runtime.deliverables],
+                        "deliverable_notes": list(runtime.deliverable_notes),
                         "activity": worker_activity(runtime.log_path, log_tail),
                         "elapsed_s": round(runtime.elapsed_s(now), 1),
                         "tokens": runtime.tokens,
@@ -974,11 +982,25 @@ class StateWriter:
     def _write_status_artifact_safe(self, state: dict[str, Any]) -> None:
         try:
             if bool(state.get("finished")) or str(state.get("state")) == "finished":
-                html = self.artifact_renderer.render_final_report_html(state)
+                artifact_html = self.artifact_renderer.render_final_report_html(
+                    state,
+                    page_path=self.artifact_path,
+                )
+                live_html = self.artifact_renderer.render_final_report_html(
+                    state,
+                    page_path=self.live_path,
+                )
             else:
-                html = self.artifact_renderer.render_status_html(state)
-            atomic_write_text(self.artifact_path, html)
-            atomic_write_text(self.live_path, html)
+                artifact_html = self.artifact_renderer.render_status_html(
+                    state,
+                    page_path=self.artifact_path,
+                )
+                live_html = self.artifact_renderer.render_status_html(
+                    state,
+                    page_path=self.live_path,
+                )
+            atomic_write_text(self.artifact_path, artifact_html)
+            atomic_write_text(self.live_path, live_html)
         except Exception as exc:
             print(f"artifact render error (status page, non-fatal): {exc}", file=sys.stderr)
 
@@ -986,9 +1008,16 @@ class StateWriter:
         if not self.artifact.enabled:
             return
         try:
-            html = self.artifact_renderer.render_final_report_html(state)
-            atomic_write_text(self.report_path, html)
-            atomic_write_text(self.version_path, html)
+            report_html = self.artifact_renderer.render_final_report_html(
+                state,
+                page_path=self.report_path,
+            )
+            version_html = self.artifact_renderer.render_final_report_html(
+                state,
+                page_path=self.version_path,
+            )
+            atomic_write_text(self.report_path, report_html)
+            atomic_write_text(self.version_path, version_html)
             self.report_written = True
             self._append_library_version_safe(state)
             # Re-flush the plain state JSON so report_ready/report_path are accurate for
@@ -1035,6 +1064,7 @@ class StateWriter:
                 report_path=self.report_path if self.report_path != self.version_path else None,
                 tasks_pass=int(totals.get("pass", state.get("pass", 0)) or 0),
                 tasks_fail=int(totals.get("fail", state.get("fail", 0)) or 0),
+                deliverables=collect_state_deliverables(state),
             )
             self.version_recorded = True
             self._last_library_state = outcome
@@ -1221,6 +1251,15 @@ def artifact_version_path(state_dir: Path, run_name: str, run_id: str) -> Path:
     )
 
 
+def artifact_deliverables_dir(state_dir: Path, run_id: str, task_key: str) -> Path:
+    return (
+        artifacts_dir(state_dir)
+        / "deliverables"
+        / sanitize_artifact_name(run_id)
+        / sanitize_artifact_name(task_key)
+    )
+
+
 def read_artifact_library(state_dir: Path) -> dict[str, Any]:
     path = artifact_library_path(state_dir)
     try:
@@ -1312,6 +1351,7 @@ def append_artifact_library_version(
     report_path: Path | None,
     tasks_pass: int,
     tasks_fail: int,
+    deliverables: list[dict[str, Any]] | None = None,
     now: datetime | None = None,
 ) -> None:
     now_iso = (now or datetime.now(timezone.utc)).isoformat()
@@ -1335,6 +1375,7 @@ def append_artifact_library_version(
         "outcome": outcome,
         "tasks_pass": tasks_pass,
         "tasks_fail": tasks_fail,
+        "deliverables": [dict(item) for item in deliverables or []],
     }
     versions = [new_version]
     for version in entry["versions"]:
@@ -1635,6 +1676,62 @@ ARTIFACT_BASE_CSS = """
     color: var(--muted);
     font-size: 12.5px;
   }
+  .work {
+    margin-bottom: clamp(28px, 5vw, 44px);
+  }
+  .work-list {
+    display: grid;
+    gap: 10px;
+    margin-top: 10px;
+  }
+  .work-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .work-main {
+    min-width: 0;
+  }
+  .work-link {
+    color: var(--ink);
+    font-size: 15px;
+    font-weight: 750;
+  }
+  .work-kind {
+    margin-top: 2px;
+    color: var(--muted);
+    font-size: 12.5px;
+  }
+  .work-task {
+    display: inline-block;
+    margin-left: 6px;
+  }
+  .work-thumb-link {
+    flex: 0 0 auto;
+  }
+  .work-thumb {
+    display: block;
+    max-width: 132px;
+    max-height: 96px;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    object-fit: cover;
+  }
+  .work.is-primary .work-list {
+    gap: 12px;
+  }
+  .work.is-primary .work-item {
+    align-items: center;
+    padding: 16px;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--surface);
+  }
+  .work.is-primary .work-link {
+    font-size: clamp(17px, 2.6vw, 22px);
+  }
   section h2 {
     margin: 0 0 4px;
     padding-bottom: 8px;
@@ -1886,6 +1983,18 @@ ARTIFACT_BASE_CSS = """
     .worker .links {
       grid-column: 1 / -1;
     }
+    .work-item,
+    .work.is-primary .work-item {
+      align-items: flex-start;
+      padding: 12px 0;
+      border-width: 0 0 1px;
+      border-radius: 0;
+      background: transparent;
+    }
+    .work-thumb {
+      max-width: 96px;
+      max-height: 72px;
+    }
     .run-links {
       gap: 6px 12px;
     }
@@ -1928,11 +2037,11 @@ class ArtifactRenderer:
         self._seen_transition_keys: set[tuple[str, str]] = set()
         self._transition_log: list[dict[str, str]] = []
 
-    def render_status_html(self, state: dict[str, Any]) -> str:
-        return render_status_html(state, renderer=self, force_wrappers=False)
+    def render_status_html(self, state: dict[str, Any], *, page_path: Path | None = None) -> str:
+        return render_status_html(state, renderer=self, force_wrappers=False, page_path=page_path)
 
-    def render_final_report_html(self, state: dict[str, Any]) -> str:
-        return render_final_report_html(state, renderer=self, force_wrappers=True)
+    def render_final_report_html(self, state: dict[str, Any], *, page_path: Path | None = None) -> str:
+        return render_final_report_html(state, renderer=self, force_wrappers=True, page_path=page_path)
 
     def render_artifact_index_html(self, entries: list[dict[str, Any]]) -> str:
         return render_artifact_index_html(entries, renderer=self, force_wrappers=False)
@@ -2097,6 +2206,35 @@ def state_tasks(state: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(tasks, list):
         return []
     return [task for task in tasks if isinstance(task, dict)]
+
+
+def collect_state_deliverables(state: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for task in state_tasks(state):
+        task_key = str(task.get("key", "task"))
+        deliverables = task.get("deliverables") or []
+        if not isinstance(deliverables, list):
+            continue
+        for item in deliverables:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            path = str(item.get("path", "")).strip()
+            if not name or not path:
+                continue
+            try:
+                size = int(item.get("bytes", 0) or 0)
+            except (TypeError, ValueError):
+                size = 0
+            items.append(
+                {
+                    "task_key": task_key,
+                    "name": name,
+                    "path": path,
+                    "bytes": size,
+                }
+            )
+    return items
 
 
 def task_status_counts(state: dict[str, Any]) -> dict[str, int]:
@@ -2331,6 +2469,153 @@ def render_progress_bar(tasks: list[dict[str, Any]], counts: dict[str, int]) -> 
     <p class="legend">{html_escape(legend)}</p>"""
 
 
+def render_work_section(
+    state: dict[str, Any],
+    *,
+    renderer: ArtifactRenderer | None,
+    page_path: Path | None,
+    force_wrappers: bool = False,
+    primary: bool = False,
+) -> str:
+    items = collect_state_deliverables(state)
+    section_class = "work is-primary" if primary else "work"
+    if not items:
+        body = '<p class="empty-note">Nothing delivered yet — the workers are still on it.</p>'
+    else:
+        rows = [
+            render_work_item(
+                item,
+                state=state,
+                renderer=renderer,
+                page_path=page_path,
+                force_wrappers=force_wrappers,
+            )
+            for item in items
+        ]
+        body = f'<div class="work-list">{"".join(rows)}</div>'
+    return f"""<section class="{section_class}" aria-labelledby="the-work-heading">
+    <h2 id="the-work-heading">The work</h2>
+    {body}
+  </section>"""
+
+
+def render_work_item(
+    item: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    renderer: ArtifactRenderer | None,
+    page_path: Path | None,
+    force_wrappers: bool = False,
+) -> str:
+    task_key = str(item.get("task_key", "task"))
+    name = str(item.get("name", "")).strip() or "work"
+    source_path = Path(str(item.get("path", "")))
+    label, kind = work_label_and_kind(name)
+    href = work_item_href(
+        source_path,
+        state=state,
+        task_key=task_key,
+        renderer=renderer,
+        page_path=page_path,
+        force_wrappers=force_wrappers,
+    )
+    thumb = ""
+    if is_image_deliverable(source_path):
+        thumb_src = image_data_uri(source_path)
+        if thumb_src:
+            thumb = (
+                f'<a class="work-thumb-link" href="{html_escape(href)}">'
+                f'<img class="work-thumb" src="{html_escape(thumb_src)}" alt=""></a>'
+            )
+    return f"""<div class="work-item">
+      {thumb}
+      <div class="work-main">
+        <a class="work-link" href="{html_escape(href)}">{html_escape(label)}</a>
+        <div class="work-kind">{html_escape(kind)} <span class="work-task muted">{html_escape(task_key)}</span></div>
+      </div>
+    </div>"""
+
+
+def work_item_href(
+    source_path: Path,
+    *,
+    state: dict[str, Any],
+    task_key: str,
+    renderer: ArtifactRenderer | None,
+    page_path: Path | None,
+    force_wrappers: bool,
+) -> str:
+    if renderer is None:
+        return "#"
+    if is_text_deliverable(source_path) and source_path.exists():
+        wrapper_path = renderer.wrapper_path(
+            run_id=str(state.get("run_id") or "run"),
+            task_key=task_key,
+            source_name=source_path.name,
+        )
+        renderer.write_wrapper(
+            source_path,
+            wrapper_path,
+            run_name=str(state.get("run_name") or "ringer"),
+            task_key=task_key,
+            force=force_wrappers,
+        )
+        return artifact_relative_href(
+            wrapper_path,
+            page_path=page_path,
+            artifact_root=renderer.artifact_dir,
+        )
+    return artifact_relative_href(source_path, page_path=page_path, artifact_root=renderer.artifact_dir)
+
+
+def artifact_relative_href(target: Path, *, page_path: Path | None, artifact_root: Path) -> str:
+    try:
+        root = artifact_root.resolve()
+        resolved_target = target.resolve()
+        if resolved_target != root and root not in resolved_target.parents:
+            return "#"
+        start = (page_path.parent if page_path is not None else artifact_root).resolve()
+        rel = os.path.relpath(resolved_target, start)
+    except (OSError, ValueError):
+        return "#"
+    return urllib.parse.quote(Path(rel).as_posix(), safe="/._-~")
+
+
+def work_label_and_kind(name: str) -> tuple[str, str]:
+    path = Path(name)
+    stem = path.stem.replace("_", " ").replace("-", " ").strip()
+    pretty = stem[:1].upper() + stem[1:] if stem else "Work"
+    suffix = path.suffix.lower()
+    if suffix in {".html", ".htm"}:
+        kind = "web page"
+    elif suffix in IMAGE_DELIVERABLE_SUFFIXES:
+        kind = "image"
+    elif suffix in TEXT_DELIVERABLE_SUFFIXES:
+        kind = "document"
+    else:
+        kind = "download"
+    return f"{pretty} — {kind}", kind
+
+
+def is_text_deliverable(path: Path) -> bool:
+    return path.suffix.lower() in TEXT_DELIVERABLE_SUFFIXES
+
+
+def is_image_deliverable(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_DELIVERABLE_SUFFIXES
+
+
+def image_data_uri(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    guessed, _encoding = mimetypes.guess_type(str(path))
+    mime = guessed if guessed and guessed.startswith("image/") else "application/octet-stream"
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
 def render_status_updates(updates: list[dict[str, str]], *, omitted: int = 0) -> str:
     if not updates:
         return '<p class="muted">No updates yet.</p>'
@@ -2376,6 +2661,7 @@ def render_status_html(
     renderer: ArtifactRenderer | None = None,
     *,
     force_wrappers: bool = False,
+    page_path: Path | None = None,
 ) -> str:
     """Tier 0 zero-LLM live status artifact. Rendered on every state flush (~1s)."""
     run_name = html_escape(str(state.get("run_name", "ringer")))
@@ -2398,6 +2684,7 @@ def render_status_html(
   {render_corner_header(state, live=True)}
   <h1 id="right-now-heading" class="briefing">{briefing}</h1>
   {render_progress_bar(tasks, counts)}
+  {render_work_section(state, renderer=renderer, page_path=page_path, force_wrappers=force_wrappers)}
   <section class="timeline" aria-labelledby="status-updates-heading">
     <h2 id="status-updates-heading">What's happening</h2>
     {render_status_updates(updates, omitted=omitted)}
@@ -2419,6 +2706,7 @@ def render_final_report_html(
     renderer: ArtifactRenderer | None = None,
     *,
     force_wrappers: bool = True,
+    page_path: Path | None = None,
 ) -> str:
     """Feature 4: self-contained final report, rendered once when a run finishes."""
     run_name = html_escape(str(state.get("run_name", "ringer")))
@@ -2440,7 +2728,7 @@ def render_final_report_html(
 <div class="page">
   {render_corner_header(state, live=False)}
   <h1 id="what-happened-heading" class="briefing">What happened — {briefing}</h1>
-  {render_progress_bar(tasks, counts)}
+  {render_work_section(state, renderer=renderer, page_path=page_path, force_wrappers=force_wrappers, primary=True)}
   <section class="timeline" aria-labelledby="status-updates-heading">
     <h2 id="status-updates-heading">What's happening</h2>
     {render_status_updates(updates, omitted=omitted)}
@@ -3321,6 +3609,7 @@ class RingerRunner:
                 duration_ms = int((time.monotonic() - attempt_started) * 1000)
                 self._log_attempt(runtime, current_spec, retrying, worker, verify, verdict, duration_ms)
                 if verdict == "PASS":
+                    self._harvest_deliverables_on_pass(runtime)
                     with self.lock:
                         runtime.status = "pass"
                         runtime.final_verdict = verdict
@@ -3339,6 +3628,45 @@ class RingerRunner:
                     runtime.final_verdict = verdict
                     runtime.ended_at_monotonic = time.monotonic()
                 return
+
+    def _harvest_deliverables_on_pass(self, runtime: TaskRuntime) -> None:
+        harvested: list[dict[str, Any]] = []
+        notes: list[str] = []
+        target_dir = artifact_deliverables_dir(
+            self.config.state_dir,
+            self.run_id,
+            runtime.task.key,
+        )
+        for expect_path in runtime.task.expect_files:
+            source = Verifier._expect_file_path(runtime.taskdir, expect_path)
+            try:
+                stat = source.stat()
+            except OSError:
+                continue
+            if not source.is_file():
+                continue
+            if stat.st_size > DELIVERABLE_MAX_BYTES:
+                notes.append(
+                    f"{source.name} was not copied because it is larger than 20 MB "
+                    f"({stat.st_size:,} bytes)."
+                )
+                continue
+            target = target_dir / source.name
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+                copied_size = target.stat().st_size
+            except OSError as exc:
+                append_text(
+                    runtime.log_path,
+                    f"[ringer.py] deliverable copy failed for {source.name}: {exc}\n",
+                )
+                continue
+            harvested.append({"name": source.name, "path": str(target), "bytes": copied_size})
+        if harvested or notes:
+            with self.lock:
+                runtime.deliverables = harvested
+                runtime.deliverable_notes.extend(notes)
 
     async def _prepare_taskdir(self, runtime: TaskRuntime) -> tuple[bool, str | None]:
         taskdir = runtime.taskdir

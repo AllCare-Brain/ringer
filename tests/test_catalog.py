@@ -87,6 +87,7 @@ class CatalogTests(unittest.TestCase):
         self.assertIsNone(by_id["openrouter/auto"]["prompt_per_m"])
         self.assertIsNone(by_id["openrouter/auto"]["completion_per_m"])
         self.assertTrue(by_id["openrouter/auto"]["variable_pricing"])
+        self.assertFalse(by_id["openrouter/auto"]["pricing_unknown"])
         self.assertFalse(by_id["openrouter/auto"]["free"])
 
     def test_refresh_appends_diff_events(self) -> None:
@@ -268,17 +269,110 @@ class CatalogTests(unittest.TestCase):
         self.assertNotIn("small-context", output)
         self.assertNotIn("embedder", output)
 
-    def test_persistent_variable_pricing_logs_once_without_price_or_free_events(self) -> None:
+    def test_missing_or_malformed_pricing_is_unknown_variable_not_free(self) -> None:
+        snapshot = self.root / "catalog.json"
+        source = source_file(
+            self.root,
+            "unknown-pricing.json",
+            [
+                {
+                    "id": "missing-pricing",
+                    "name": "missing-pricing",
+                    "context_length": 64000,
+                    "architecture": {"modality": "text->text"},
+                    "pricing": None,
+                },
+                {
+                    "id": "malformed-pricing",
+                    "name": "malformed-pricing",
+                    "context_length": 64000,
+                    "architecture": {"modality": "text->text"},
+                    "pricing": {"prompt": "abc", "completion": "0"},
+                },
+                model("free", prompt="0", completion="0"),
+                model("cheap-candidate", prompt="0.0000005", completion="0.0000005"),
+            ],
+        )
+        refresh_openrouter_catalog(snapshot, source=str(source))
+
+        models = json.loads(snapshot.read_text(encoding="utf-8"))["models"]
+        by_id = {item["id"]: item for item in models}
+        for model_id in ("missing-pricing", "malformed-pricing"):
+            self.assertTrue(by_id[model_id]["pricing_unknown"])
+            self.assertTrue(by_id[model_id]["variable_pricing"])
+            self.assertIsNone(by_id[model_id]["prompt_per_m"])
+            self.assertIsNone(by_id[model_id]["completion_per_m"])
+            self.assertFalse(by_id[model_id]["free"])
+
+        free_args = argparse.Namespace(
+            refresh=False,
+            source=None,
+            file=snapshot,
+            free=True,
+            changes=False,
+            json=True,
+        )
+        free_out = io.StringIO()
+        with contextlib.redirect_stdout(free_out):
+            self.assertEqual(0, run_catalog_command(free_args))
+        self.assertEqual(["free"], [item["id"] for item in json.loads(free_out.getvalue())])
+
+        log_path = self.root / "eval.jsonl"
+        log_path.write_text("", encoding="utf-8")
+        config = AppConfig(
+            path=None,
+            identity_default=None,
+            state_dir=self.root / "state",
+            dashboard_port_base=8787,
+            hud_port=8700,
+            hud_app_path=None,
+            allow_full_access=False,
+            eval=EvalConfig(backend="jsonl", jsonl_path=log_path),
+            engines={},
+            artifact=ArtifactConfig(
+                enabled=False,
+                out_template=str(self.root / "live.html"),
+                report_template=str(self.root / "report.html"),
+                index_out=self.root / "index.html",
+            ),
+        )
+        explore_args = argparse.Namespace(
+            log=log_path,
+            task_type=None,
+            model=None,
+            engine=None,
+            since=None,
+            explore=True,
+            catalog_file=snapshot,
+            json=False,
+        )
+        explore_out = io.StringIO()
+        with contextlib.redirect_stdout(explore_out):
+            self.assertEqual(0, run_models_command(config, explore_args))
+        output = explore_out.getvalue()
+        self.assertIn("cheap-candidate", output)
+        self.assertNotIn("missing-pricing", output)
+        self.assertNotIn("malformed-pricing", output)
+
+    def test_variable_pricing_transitions_log_once_and_fixed_prices(self) -> None:
         snapshot = self.root / "catalog.json"
         old_source = source_file(
             self.root,
             "old.json",
-            [model("openrouter/auto", prompt="0", completion="0")],
+            [
+                model("to-variable", prompt="0", completion="0"),
+                model("to-fixed", prompt="-1", completion="-1"),
+                model("to-free", prompt="-1", completion="-1"),
+            ],
         )
         sentinel_source = source_file(
             self.root,
             "sentinel.json",
-            [model("openrouter/auto", prompt="-1", completion="-1")],
+            [
+                model("to-variable", prompt="-1", completion="-1"),
+                model("to-fixed", prompt="0.000001", completion="0.000002"),
+                model("to-free", prompt="0", completion="0"),
+            ],
         )
 
         refresh_openrouter_catalog(snapshot, source=str(old_source))
@@ -289,11 +383,52 @@ class CatalogTests(unittest.TestCase):
             json.loads(line)
             for line in catalog_changes_path(snapshot).read_text(encoding="utf-8").splitlines()
         ]
-        persisted_rows = [row for row in rows if row["id"] == "openrouter/auto"]
+        rows_by_id: dict[str, list[dict[str, object]]] = {}
+        for row in rows:
+            rows_by_id.setdefault(str(row["id"]), []).append(row)
         self.assertEqual(
             ["added", "pricing_variable"],
-            [row["kind"] for row in persisted_rows],
+            [row["kind"] for row in rows_by_id["to-variable"]],
         )
+        self.assertEqual(
+            ["added", "pricing_fixed"],
+            [row["kind"] for row in rows_by_id["to-fixed"]],
+        )
+        fixed = rows_by_id["to-fixed"][1]
+        self.assertEqual(1.0, fixed["new_prompt_per_m"])
+        self.assertEqual(2.0, fixed["new_completion_per_m"])
+        self.assertEqual(
+            ["added", "pricing_fixed", "went_free"],
+            [row["kind"] for row in rows_by_id["to-free"]],
+        )
+
+    def test_refresh_appends_events_before_snapshot_replace(self) -> None:
+        snapshot = self.root / "catalog.json"
+        old_source = source_file(
+            self.root,
+            "old.json",
+            [model("changed", prompt="0.000001", completion="0.000002")],
+        )
+        new_source = source_file(
+            self.root,
+            "new.json",
+            [model("changed", prompt="0", completion="0")],
+        )
+
+        refresh_openrouter_catalog(snapshot, source=str(old_source))
+        before = snapshot.read_text(encoding="utf-8")
+
+        with mock.patch("ringer.atomic_write_json", side_effect=RuntimeError("write stopped")):
+            with self.assertRaisesRegex(RuntimeError, "write stopped"):
+                refresh_openrouter_catalog(snapshot, source=str(new_source))
+
+        self.assertEqual(before, snapshot.read_text(encoding="utf-8"))
+        rows = [
+            json.loads(line)
+            for line in catalog_changes_path(snapshot).read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertIn(("price_change", "changed"), {(row["kind"], row["id"]) for row in rows})
+        self.assertIn(("went_free", "changed"), {(row["kind"], row["id"]) for row in rows})
 
     def test_auto_refresh_throttling_env_and_exception_swallowing(self) -> None:
         snapshot = self.root / "catalog.json"
@@ -328,6 +463,30 @@ class CatalogTests(unittest.TestCase):
             self.assertIsNotNone(thread)
             assert thread is not None
             thread.join(timeout=2)
+
+    def test_auto_refresh_free_notice_goes_to_stderr(self) -> None:
+        snapshot = self.root / "catalog.json"
+        snapshot.write_text('{"models":[]}', encoding="utf-8")
+        stale = time.time() - (25 * 60 * 60)
+        os.utime(snapshot, (stale, stale))
+
+        result = CatalogRefreshResult(
+            path=snapshot,
+            changes_path=catalog_changes_path(snapshot),
+            models=[],
+            events=[{"kind": "went_free", "id": "new-free-model"}],
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch("ringer.refresh_openrouter_catalog", return_value=result):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                thread = start_catalog_auto_refresh(snapshot_path=snapshot, print_notice=True)
+                self.assertIsNotNone(thread)
+                assert thread is not None
+                thread.join(timeout=2)
+
+        self.assertEqual("", stdout.getvalue())
+        self.assertIn("Catalog refresh: model went FREE: new-free-model", stderr.getvalue())
 
 
 if __name__ == "__main__":

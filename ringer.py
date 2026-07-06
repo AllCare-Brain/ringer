@@ -1228,8 +1228,24 @@ def catalog_decimal(value: Any) -> Decimal:
         return Decimal("0")
 
 
+def catalog_decimal_or_none(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        return Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+
+
 def catalog_per_m(value: Any) -> float:
     return float(catalog_decimal(value) * Decimal("1000000"))
+
+
+def catalog_per_m_decimal(value: Decimal) -> float:
+    return float(value * Decimal("1000000"))
 
 
 def catalog_price_equal(left: Any, right: Any) -> bool:
@@ -1246,18 +1262,21 @@ def normalize_catalog_model(raw: dict[str, Any], *, fetched_at: str) -> dict[str
     architecture = raw.get("architecture")
     architecture_obj = architecture if isinstance(architecture, dict) else {}
     model_id = str(raw.get("id", "")).strip()
-    variable_pricing = catalog_price_is_negative(pricing_obj.get("prompt")) or catalog_price_is_negative(
-        pricing_obj.get("completion")
-    )
-    prompt_per_m = None if variable_pricing else catalog_per_m(pricing_obj.get("prompt"))
-    completion_per_m = None if variable_pricing else catalog_per_m(pricing_obj.get("completion"))
+    prompt_price = catalog_decimal_or_none(pricing_obj.get("prompt"))
+    completion_price = catalog_decimal_or_none(pricing_obj.get("completion"))
+    pricing_unknown = prompt_price is None or completion_price is None
+    variable_pricing = pricing_unknown or prompt_price < 0 or completion_price < 0
+    prompt_per_m = None if variable_pricing else catalog_per_m_decimal(prompt_price)
+    completion_per_m = None if variable_pricing else catalog_per_m_decimal(completion_price)
     is_free = not variable_pricing and (
         model_id.endswith(":free")
         or (
-            catalog_price_equal(pricing_obj.get("prompt"), 0)
-            and catalog_price_equal(pricing_obj.get("completion"), 0)
+            prompt_price == 0
+            and completion_price == 0
         )
     )
+    if model_id.endswith(":free"):
+        is_free = True
     context_length_raw = raw.get("context_length")
     try:
         context_length = int(context_length_raw)
@@ -1272,6 +1291,7 @@ def normalize_catalog_model(raw: dict[str, Any], *, fetched_at: str) -> dict[str
         "prompt_per_m": prompt_per_m,
         "completion_per_m": completion_per_m,
         "variable_pricing": variable_pricing,
+        "pricing_unknown": pricing_unknown,
         "free": is_free,
         "fetched_at": fetched_at,
     }
@@ -1335,6 +1355,7 @@ def catalog_event_model_details(model: dict[str, Any]) -> dict[str, Any]:
         "prompt_per_m": model.get("prompt_per_m", 0),
         "completion_per_m": model.get("completion_per_m", 0),
         "variable_pricing": bool(model.get("variable_pricing")),
+        "pricing_unknown": bool(model.get("pricing_unknown")),
         "free": bool(model.get("free")),
         "context_length": model.get("context_length", 0),
         "modality": model.get("modality", ""),
@@ -1388,6 +1409,33 @@ def diff_catalog_snapshots(
                 )
             continue
         if old_variable:
+            events.append(
+                {
+                    "ts": ts,
+                    "kind": "pricing_fixed",
+                    "id": model_id,
+                    "name": new.get("name", old.get("name", "")),
+                    "old_prompt_per_m": old_prompt,
+                    "new_prompt_per_m": new_prompt,
+                    "old_completion_per_m": old_completion,
+                    "new_completion_per_m": new_completion,
+                    "old_free": old_free,
+                    "new_free": new_free,
+                }
+            )
+            if new_free:
+                events.append(
+                    {
+                        "ts": ts,
+                        "kind": "went_free",
+                        "id": model_id,
+                        "name": new.get("name", old.get("name", "")),
+                        "old_prompt_per_m": old_prompt,
+                        "new_prompt_per_m": new_prompt,
+                        "old_completion_per_m": old_completion,
+                        "new_completion_per_m": new_completion,
+                    }
+                )
             continue
         price_changed = old_prompt != new_prompt or old_completion != new_completion
         if price_changed:
@@ -1438,6 +1486,33 @@ def append_catalog_events(path: Path, events: list[dict[str, Any]]) -> None:
             fh.write(json.dumps(event, sort_keys=True) + "\n")
 
 
+@contextlib.contextmanager
+def catalog_refresh_lock(snapshot_path: Path) -> Iterable[None]:
+    lock_path = snapshot_path.with_name(snapshot_path.name + ".lock")
+    try:
+        import fcntl
+    except Exception:
+        yield
+        return
+    fh = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = lock_path.open("a", encoding="utf-8")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    except Exception:
+        if fh is not None:
+            with contextlib.suppress(Exception):
+                fh.close()
+        yield
+        return
+    try:
+        yield
+    finally:
+        with contextlib.suppress(Exception):
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+
+
 def refresh_openrouter_catalog(
     snapshot_path: Path,
     *,
@@ -1445,15 +1520,19 @@ def refresh_openrouter_catalog(
     timeout: float = CATALOG_FETCH_TIMEOUT_S,
 ) -> CatalogRefreshResult:
     snapshot_path = snapshot_path.expanduser().resolve()
-    ts = utc_now_iso()
-    old_models = load_catalog_snapshot(snapshot_path)
-    payload = fetch_catalog_payload(source, timeout=timeout)
-    new_models = normalize_catalog_payload(payload, fetched_at=ts)
-    events = diff_catalog_snapshots(old_models, new_models, ts=ts)
-    snapshot = {"fetched_at": ts, "models": new_models}
-    atomic_write_json(snapshot_path, snapshot)
     changes_path = catalog_changes_path(snapshot_path)
-    append_catalog_events(changes_path, events)
+    with catalog_refresh_lock(snapshot_path):
+        ts = utc_now_iso()
+        old_models = load_catalog_snapshot(snapshot_path)
+        payload = fetch_catalog_payload(source, timeout=timeout)
+        new_models = normalize_catalog_payload(payload, fetched_at=ts)
+        events = diff_catalog_snapshots(old_models, new_models, ts=ts)
+        snapshot = {"fetched_at": ts, "models": new_models}
+        append_catalog_events(changes_path, events)
+        # Append events before replacing the snapshot: a crash here can duplicate
+        # events on the next refresh, but duplicated events are recoverable and
+        # silently lost catalog changes are not.
+        atomic_write_json(snapshot_path, snapshot)
     return CatalogRefreshResult(
         path=snapshot_path,
         changes_path=changes_path,
@@ -1522,6 +1601,12 @@ def describe_catalog_event(event: dict[str, Any]) -> str:
         return f"{ts} {model_id} {kind}"
     if kind == "pricing_variable":
         return f"{ts} {model_id} pricing_variable"
+    if kind == "pricing_fixed":
+        return (
+            f"{ts} {model_id} pricing_fixed: "
+            f"in {format_catalog_price(event.get('new_prompt_per_m'))}, "
+            f"out {format_catalog_price(event.get('new_completion_per_m'))}"
+        )
     if kind == "added":
         marker = " FREE" if event.get("free") else ""
         return f"{ts} {model_id} added{marker}"
@@ -1594,7 +1679,7 @@ def start_catalog_auto_refresh(
             if print_notice and went_free:
                 sample = ", ".join(str(event.get("id")) for event in went_free[:3])
                 extra = "" if len(went_free) <= 3 else f" and {len(went_free) - 3} more"
-                print(f"Catalog refresh: model went FREE: {sample}{extra}", flush=True)
+                print(f"Catalog refresh: model went FREE: {sample}{extra}", file=sys.stderr, flush=True)
         except Exception:
             pass
 
@@ -4143,13 +4228,32 @@ def read_model_log_rows(
             if not isinstance(row, dict):
                 skipped += 1
                 continue
-            if since is not None:
-                logged_date = parse_log_date(row.get("logged_at"))
-                if not logged_date or logged_date < since:
-                    continue
             if engine is not None and model_log_text(row.get("worker_engine")) != engine:
                 continue
             rows.append(row)
+    if since is not None:
+        task_rows_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in rows:
+            run_id = model_log_text(row.get("run_id"))
+            task_key = model_log_text(row.get("task_key"))
+            task_rows_by_key.setdefault((run_id, task_key), []).append(row)
+        selected_keys: set[tuple[str, str]] = set()
+        for key, task_rows in task_rows_by_key.items():
+            ordered = sorted(
+                task_rows,
+                key=lambda row: (
+                    model_log_text(row.get("logged_at")),
+                    1 if model_log_row_is_retry(row) else 0,
+                ),
+            )
+            final_date = parse_log_date(ordered[-1].get("logged_at"))
+            if final_date and final_date >= since:
+                selected_keys.add(key)
+        rows = [
+            row
+            for row in rows
+            if (model_log_text(row.get("run_id")), model_log_text(row.get("task_key"))) in selected_keys
+        ]
     return rows, skipped
 
 

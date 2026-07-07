@@ -70,6 +70,9 @@ token_regex = "tokens\\s+used\\s*:?\\s*([0-9][0-9,]*)"
 # macOS): profile "workspace" = read everywhere, write CWD + temp + ~/.grok,
 # network allowed. Models: grok-build, grok-composer-2.5-fast (route with the
 # per-task "model" field). Verified against Grok Build v0.2.81 (2026-07-06).
+# Note: --no-auto-update is accepted but absent from --help in v0.2.81 (grok
+# rejects unknown flags, so this is a hidden flag, not a typo) — it stops the
+# CLI self-updating mid-swarm.
 # Uncomment to enable.
 # [engines.grok]
 # bin = "grok"

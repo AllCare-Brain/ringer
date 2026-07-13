@@ -45,6 +45,7 @@ jsonl_path = "~/.ringer/runs.jsonl"
 # Public default resolves this with shutil.which("codex"). Set an absolute path
 # here only for machine-specific installs.
 bin = "codex"
+model_default = "gpt-5.6-terra"
 
 # Placeholders:
 # - {taskdir}: task working directory
@@ -61,6 +62,8 @@ bin = "codex"
 args_template = [
   "exec",
   "--skip-git-repo-check",
+  "-c",
+  "model_reasoning_effort=medium",
   "{access_args}",
   "{model_args}",
   "{engine_args}",
@@ -79,6 +82,26 @@ token_regex = "tokens\\s+used\\s*:?\\s*([0-9][0-9,]*)"
 # First capture group should be the model slug self-reported by the harness.
 # Ringer applies this to captured worker output after every attempt. The Codex
 # default reads the `model:` header; override it here only if that format changes.
+model_report_regex = "(?m)^model:[ \\t]*([^ \\t\\r\\n]+)[ \\t]*\\r?$"
+
+# Codex-compatible high-complexity planning/orchestration lane.
+[engines.sol]
+bin = "codex"
+model_default = "gpt-5.6-sol"
+args_template = ["exec", "--skip-git-repo-check", "-c", "model_reasoning_effort=xhigh", "{access_args}", "{model_args}", "{engine_args}", "-C", "{taskdir}", "{spec}"]
+sandbox_args = ["--sandbox", "workspace-write"]
+full_access_args = ["--dangerously-bypass-approvals-and-sandbox"]
+token_regex = "tokens\\s+used\\s*:?\\s*([0-9][0-9,]*)"
+model_report_regex = "(?m)^model:[ \\t]*([^ \\t\\r\\n]+)[ \\t]*\\r?$"
+
+# Codex-compatible low-cost lane for cron, heartbeat, and background work.
+[engines.luna]
+bin = "codex"
+model_default = "gpt-5.6-luna"
+args_template = ["exec", "--skip-git-repo-check", "-c", "model_reasoning_effort=low", "{access_args}", "{model_args}", "{engine_args}", "-C", "{taskdir}", "{spec}"]
+sandbox_args = ["--sandbox", "workspace-write"]
+full_access_args = ["--dangerously-bypass-approvals-and-sandbox"]
+token_regex = "tokens\\s+used\\s*:?\\s*([0-9][0-9,]*)"
 model_report_regex = "(?m)^model:[ \\t]*([^ \\t\\r\\n]+)[ \\t]*\\r?$"
 
 # Grok Build CLI (xAI). Install: curl -fsSL https://x.ai/cli/install.sh | bash

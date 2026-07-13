@@ -152,6 +152,12 @@ args_template = ["run", "{spec}", "--dir", "{taskdir}"]
 
 Per-task `"engine": "mymodel"` routes work to it — the invariants (stdin closed, process-group kill, executed verification, raw logs) apply to every engine identically.
 
+### Entry-environment contract
+
+The session that starts the work keeps its parent orchestrator. Codex Desktop, CLI, and terminal sessions — plus Hermes Atlas, Coder, and Max — use GPT-5.6 Sol at `xhigh` reasoning effort (or the maximum effort that surface exposes) for parent planning and orchestration. Claude Desktop, CLI, terminal, and VS Code sessions use Fable 5 as the parent orchestrator.
+
+Ringer does not replace an already-running parent orchestrator. Its workers are independently selected per task: `codex` is the normal daily-coding lane (GPT-5.6 Terra, `medium`), `sol` is the high-complexity planning/orchestration worker lane (GPT-5.6 Sol, `xhigh`), and `luna` is the low-cost cron, heartbeat, and background lane (GPT-5.6 Luna, `low`).
+
 ### The universal harness: OpenCode + OpenRouter
 
 Unless a model ships its own first-class harness (Codex does), OpenCode is the harness that runs it — one engine block covers every OpenRouter-served model. `config.sample.toml` includes a ready-to-uncomment engine whose `{model}` placeholder is filled per task from the manifest's `"model"` field, with `model_default` as the fallback. The shipped default is OpenRouter's `z-ai/glm-5.2` — roughly $0.74/M input and $2.33/M output (2026-07), about 20-30x cheaper output than frontier coding models; a complete write-code-and-pass-the-check task lands around a penny.

@@ -67,10 +67,10 @@ def write_registry(path: Path) -> None:
 [engines.codex]
 harness = "Codex CLI"
 access = "OAuth plan"
-default_model_key = "gpt-5.5"
+default_model_key = "gpt-5.6-terra"
 
-[engines.codex.models."gpt-5.5"]
-display = "GPT-5.5"
+[engines.codex.models."gpt-5.6-terra"]
+display = "GPT-5.6 Terra"
 confidence = "unverified"
 source = ""
 
@@ -428,7 +428,7 @@ class ModelDbTests(unittest.TestCase):
         unlisted = registry.resolve("opencode", "openrouter/vendor/model")
         unknown = registry.resolve("custom-engine", "custom-model")
 
-        self.assertEqual(("GPT-5.5", "Codex CLI", "OAuth plan"), (codex.model_display, codex.harness, codex.access))
+        self.assertEqual(("GPT-5.6 Terra", "Codex CLI", "OAuth plan"), (codex.model_display, codex.harness, codex.access))
         self.assertEqual(("GLM 5.2", "OpenCode", "OpenRouter API"), (listed.model_display, listed.harness, listed.access))
         self.assertEqual(("openrouter/vendor/model", "OpenCode", "OpenRouter API"), (unlisted.model_display, unlisted.harness, unlisted.access))
         # Unknown engine + model: display the MODEL slug, never the engine name.

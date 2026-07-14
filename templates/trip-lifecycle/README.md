@@ -110,4 +110,4 @@ python3 templates/trip-lifecycle/checks/trip_contract.py \
 
 ## Orchestrator responsibilities
 
-Lifecycle state, approvals, round caps, verdict routing, side-effect checkpoints, the hotfix lane, and the promotion smoke gate are Open Engine duties, not this kit's. The enforcing procedure is the `TRIP Protocol (Implementation Issues)` section of `gbrain-allcare/skills/open-agent-engine/SKILL.md`. Terms live in `CONTEXT.md`; the upstream-divergence decision lives in `docs/adr/0001-native-four-phase-trip.md`.
+Lifecycle state, approvals, round caps, verdict routing, side-effect checkpoints, the hotfix lane, and the promotion smoke gate are Open Engine duties, not this kit's. The enforcing procedure is section 13 (TRIP lifecycle) of `gbrain-allcare/skills/open-agent-engine/references/ringer-execution-lane.md`, the single source of truth for the lifecycle. Terms live in `CONTEXT.md`; the upstream-divergence decision lives in `docs/adr/0001-native-four-phase-trip.md`.

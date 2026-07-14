@@ -1,0 +1,25 @@
+{
+  "run_name": "{{OPE_ISSUE_LOWER}}-{{RUN_SLUG}}",
+  "workdir": "{{WORKDIR}}",
+  "max_parallel": 1,
+  "trip": {
+    "issue": "{{OPE_ISSUE}}",
+    "phase": "{{PHASE}}",
+    "plan_version": 1
+  },
+  "tasks": [
+    {
+      "key": "{{PHASE}}-{{TASK_KEY}}",
+      "engine": "{{ENGINE}}",
+      "model": "{{MODEL}}",
+      "task_type": "{{TASK_TYPE}}",
+      "timeout_s": 2400,
+      "expect_files": [
+        "{{OUTPUT_FILE}}"
+      ],
+      "spec": "You are the {{PHASE}} ring for {{OPE_ISSUE}}. Work only inside the approved phase envelope and produce {{OUTPUT_FILE}}. Read the exact approved manifest and source files named in this brief; do not expand scope or invent missing product facts. Ringer executes every declared check and retries a failed task once. Open Engine owns lifecycle state, human approvals, and all commit, push, tag, publish, deploy, and PR side effects. Never perform those side effects yourself.\n\nAPPROVED PHASE BRIEF: {{PHASE_BRIEF}}\n\nOUTPUT CONTRACT: {{OUTPUT_CONTRACT}}\n\nHOW TO RUN: {{HOW_TO_RUN}}\n\nIf a load-bearing decision is missing, write the blocker into the declared output and fail the check instead of guessing.",
+      "check": "{{PHASE_CHECK}}",
+      "verified": "the plan-declared phase-specific output contract passed"
+    }
+  ]
+}

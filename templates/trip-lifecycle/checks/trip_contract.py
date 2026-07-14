@@ -64,9 +64,12 @@ def validate_manifest(path: Path, ringer: Path, expected_run_name: str, expected
     elif run_name != expected_issue.lower() and not run_name.startswith(expected_issue.lower() + "-"):
         failures.append(fail("run_name_issue_mismatch", "run_name must be the expected issue or start with it"))
 
+    # Execute ringer directly: it is a #!/bin/sh polyglot that self-selects a
+    # supported Python; running it via sys.executable bypasses that and makes
+    # the lint verdict depend on the checker's own interpreter.
     try:
         lint = subprocess.run(
-            [sys.executable, str(ringer), "lint", str(path)],
+            [str(ringer.resolve()), "lint", str(path)],
             capture_output=True,
             text=True,
             timeout=60,

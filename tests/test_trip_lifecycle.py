@@ -25,7 +25,8 @@ class TripLifecycleContractTests(unittest.TestCase):
 
     def make_ringer(self, temp: str) -> Path:
         ringer = Path(temp) / "ringer.py"
-        ringer.write_text("import sys\nsys.exit(0 if sys.argv[1:] else 1)\n", encoding="utf-8")
+        ringer.write_text('#!/bin/sh\n[ "$#" -gt 0 ] && exit 0\nexit 1\n', encoding="utf-8")
+        ringer.chmod(0o755)
         return ringer
 
     def manifest_args(self, manifest: Path, issue: str = "OPE-305") -> tuple[str, ...]:
@@ -160,7 +161,7 @@ class TripLifecycleContractTests(unittest.TestCase):
                 "tasks": [{"key": "review", "task_type": "review", "spec": "x", "check": "python3 -c 'pass'", "expect_files": ["review.md"], "verified": "x"}],
             }), encoding="utf-8")
             ringer = self.make_ringer(temp)
-            ringer.write_text("import sys\nsys.exit(1)\n", encoding="utf-8")
+            ringer.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
             result = self.run_checker(
                 "manifest", "--manifest", str(manifest), "--ringer", str(ringer),
                 "--expected-run-name", "ope-305-trip-protocol", "--expected-issue", "OPE-305",

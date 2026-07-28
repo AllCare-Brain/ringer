@@ -12,6 +12,9 @@ sys.path.insert(0, str(ROOT))
 
 from ringer import ARTIFACT_BASE_CSS, ArtifactRenderer, render_final_report_html, render_status_html  # noqa: E402
 
+REFERENCE = Path(__file__).resolve().parent / "fixtures" / "design-reference.html"
+
+
 def css_block(css: str, selector: str) -> str:
     pattern = re.escape(selector) + r"\s*\{(?P<body>.*?)\}"
     match = re.search(pattern, css, re.S)
@@ -44,28 +47,20 @@ class DesignReferenceTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.renderer = ArtifactRenderer(Path(self.tmp.name) / "artifacts" / "run.html")
 
-    def test_renderer_defines_portable_theme_token_contract(self) -> None:
-        expected_dark = {
-            "--ground": "#0b0e14", "--surface": "#141a26", "--ink": "#e9eef7",
-            "--muted": "#8fa0b6", "--hairline": "rgba(143,160,182,.22)",
-            "--accent": "#35d0ff", "--pass": "#45d17e", "--fail": "#ff5f6b",
-            "--waiting": "#6f7c92", "--quote-bg": "rgba(255,95,107,.08)",
-        }
-        expected_light = {
-            "--ground": "#f2f5f9", "--surface": "#ffffff", "--ink": "#17202e",
-            "--muted": "#5a6a7e", "--hairline": "rgba(90,106,126,.28)",
-            "--accent": "#007fb0", "--pass": "#178a4c", "--fail": "#cc3340",
-            "--waiting": "#7d8ba0", "--quote-bg": "rgba(204,51,64,.07)",
-        }
-        dark = token_values(css_block(ARTIFACT_BASE_CSS, ":root"))
-        light = token_values(media_light_root(ARTIFACT_BASE_CSS))
-        dark_override = token_values(css_block(ARTIFACT_BASE_CSS, ':root[data-theme="dark"]'))
-        light_override = token_values(css_block(ARTIFACT_BASE_CSS, ':root[data-theme="light"]'))
+    def test_renderer_tokens_match_design_reference(self) -> None:
+        # The fixture is committed; a missing file is a broken guard, never a skip.
+        self.assertTrue(REFERENCE.is_file(), f"committed design reference fixture is missing: {REFERENCE}")
+        reference_css = REFERENCE.read_text(encoding="utf-8")
 
-        self.assertEqual(expected_dark, dark)
-        self.assertEqual(expected_light, light)
-        self.assertEqual(dark, dark_override)
-        self.assertEqual(light, light_override)
+        expected_dark = token_values(css_block(reference_css, ":root"))
+        expected_light = token_values(media_light_root(reference_css))
+        expected_dark_override = token_values(css_block(reference_css, ':root[data-theme="dark"]'))
+        expected_light_override = token_values(css_block(reference_css, ':root[data-theme="light"]'))
+
+        self.assertEqual(expected_dark, token_values(css_block(ARTIFACT_BASE_CSS, ":root")))
+        self.assertEqual(expected_light, token_values(media_light_root(ARTIFACT_BASE_CSS)))
+        self.assertEqual(expected_dark_override, token_values(css_block(ARTIFACT_BASE_CSS, ':root[data-theme="dark"]')))
+        self.assertEqual(expected_light_override, token_values(css_block(ARTIFACT_BASE_CSS, ':root[data-theme="light"]')))
 
     def test_live_page_uses_reference_structure(self) -> None:
         render_status_html(
@@ -91,6 +86,8 @@ class DesignReferenceTests(unittest.TestCase):
         self.assertIn('<div class="work-group">', html)
         self.assertIn('<div class="worker">', html)
         self.assertIn('aria-label="4 tasks: 1 passed, 1 working, 1 retrying, 1 waiting, 0 failed"', html)
+        self.assertIn('<span class="retry" aria-label="contract-a: sent back — redoing"></span>', html)
+        self.assertIn('<span class="working" aria-label="contract-b: working"></span>', html)
 
     def test_final_page_uses_static_dot(self) -> None:
         html = render_final_report_html(

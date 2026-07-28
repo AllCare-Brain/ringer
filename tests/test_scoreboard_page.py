@@ -304,9 +304,7 @@ class ScoreboardPageTests(unittest.TestCase):
             html = self.render_to(self.root / "scoreboard.html")
 
         self.assertIn("<h1 class=\"scoreboard-title\">Model performance scoreboard</h1>", html)
-        # Fork keeps the date-agnostic regex: upstream's literal "July 6, 2026"
-        # rots the moment the calendar moves past it.
-        self.assertRegex(html, r"Generated [A-Z][a-z]+ [0-9]{1,2}, [0-9]{4}")
+        self.assertIn("<span>Generated July 6, 2026</span>", html)
         self.assertIn('>eval log</a>', html)
         self.assertIn('>catalog</a>', html)
         self.assertIn('>model notes</a>', html)

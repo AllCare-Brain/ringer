@@ -27,11 +27,18 @@ EXCLUDED_AUTHORS = {
     "jonathan edwards",
     "nate jones",
     "github",
+    # Fork side: this repo's own maintainer and its automation identity are not
+    # community contributors to it, exactly as the upstream maintainers above
+    # are not. Community PRs to the fork still have to be credited.
+    "ramy barsoum",
+    "allcare-brain-atlas[bot]",
 }
 EXCLUDED_AUTHOR_PREFIXES = ("claude",)
 EXCLUDED_HANDLES = {
     "justfinethanku",
     "natebjones-projects",
+    # Fork side: merges from this repo's own org, per the same rule.
+    "allcare-brain",
 }
 
 MERGE_SUBJECT_RE = re.compile(r"^Merge pull request #\d+ from ([^/\s]+)/")

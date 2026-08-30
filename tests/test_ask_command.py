@@ -449,3 +449,21 @@ class NewFieldTypeStrictnessTests(unittest.TestCase):
         task = TaskSpec.from_obj(self._task())
         self.assertEqual(2, task.max_attempts)
         self.assertFalse(task.redact_spec)
+        self.assertEqual(60, task.check_timeout_s)
+
+    def test_check_timeout_s_override_is_kept(self) -> None:
+        task = TaskSpec.from_obj(self._task(check_timeout_s=7200))
+        self.assertEqual(7200, task.check_timeout_s)
+
+    def test_fractional_check_timeout_s_is_rejected(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            TaskSpec.from_obj(self._task(check_timeout_s=1.5))
+        self.assertIn("check_timeout_s must be an integer", str(caught.exception))
+
+    def test_string_check_timeout_s_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "check_timeout_s must be an integer"):
+            TaskSpec.from_obj(self._task(check_timeout_s="7200"))
+
+    def test_non_positive_check_timeout_s_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "check_timeout_s must be positive"):
+            TaskSpec.from_obj(self._task(check_timeout_s=0))

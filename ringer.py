@@ -1653,6 +1653,8 @@ class TaskSpec:
     # engine's {model} placeholder); empty means the engine's model_default.
     model: str = ""
     task_type: str = ""
+    # Post-worker check kill timer. Independent of timeout_s (the worker).
+    check_timeout_s: int = CHECK_TIMEOUT_S
 
     @classmethod
     def from_obj(cls, obj: dict[str, Any]) -> "TaskSpec":
@@ -1705,6 +1707,15 @@ class TaskSpec:
         task_type = obj.get("task_type", "")
         if not isinstance(task_type, str):
             raise ValueError(f"task {key}: task_type must be a string")
+        raw_check_timeout_s = obj.get("check_timeout_s", CHECK_TIMEOUT_S)
+        if isinstance(raw_check_timeout_s, bool) or not isinstance(raw_check_timeout_s, int):
+            raise ValueError(
+                f"task {key}: check_timeout_s must be an integer, "
+                f"got {type(raw_check_timeout_s).__name__}"
+            )
+        check_timeout_s = raw_check_timeout_s
+        if check_timeout_s <= 0:
+            raise ValueError(f"task {key}: check_timeout_s must be positive")
         return cls(
             key=key,
             spec=spec,
@@ -1719,6 +1730,7 @@ class TaskSpec:
             verified=verified.strip(),
             model=model.strip(),
             task_type=task_type.strip(),
+            check_timeout_s=check_timeout_s,
         )
 
 
@@ -2309,6 +2321,7 @@ class StateWriter:
                     "check_output_tail": shorten(runtime.last_check_output, 4000),
                     "setup_error": runtime.setup_error,
                     "timeout_s": runtime.task.timeout_s,
+                    "check_timeout_s": runtime.task.check_timeout_s,
                     "max_attempts": runtime.task.max_attempts,
                     "taskdir": str(runtime.taskdir),
                     "log_path": str(runtime.log_path),
@@ -8618,7 +8631,9 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
 
 class Verifier:
     async def verify(self, task: TaskSpec, taskdir: Path) -> VerifyResult:
-        check_returncode, check_timed_out, output = await self._run_check(task.check, taskdir)
+        check_returncode, check_timed_out, output = await self._run_check(
+            task.check, taskdir, timeout_s=task.check_timeout_s
+        )
         missing_files = tuple(
             rel for rel in task.expect_files if not self._is_nonempty_file(self._expect_file_path(taskdir, rel))
         )
@@ -8656,7 +8671,12 @@ class Verifier:
         return candidate if candidate.is_absolute() else taskdir / candidate
 
     @staticmethod
-    async def _run_check(command: str, cwd: Path) -> tuple[int | None, bool, str]:
+    async def _run_check(
+        command: str,
+        cwd: Path,
+        timeout_s: int | None = None,
+    ) -> tuple[int | None, bool, str]:
+        limit = CHECK_TIMEOUT_S if timeout_s is None else timeout_s
         proc = await asyncio.create_subprocess_shell(
             command,
             cwd=str(cwd),
@@ -8667,7 +8687,7 @@ class Verifier:
         )
         timed_out = False
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CHECK_TIMEOUT_S)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=limit)
         except asyncio.TimeoutError:
             timed_out = True
             terminate_process_group(proc)
@@ -8678,7 +8698,7 @@ class Verifier:
                 stdout, _ = await proc.communicate()
         output = stdout.decode("utf-8", errors="replace") if stdout else ""
         if timed_out:
-            output += f"\n[ringer.py] check timed out after {CHECK_TIMEOUT_S}s\n"
+            output += f"\n[ringer.py] check timed out after {limit}s\n"
         return proc.returncode, timed_out, output
 
 
@@ -10066,6 +10086,7 @@ def dry_run(
         print(f"    engine: {task.engine}")
         print(f"    dir: {taskdir}")
         print(f"    timeout_s: {task.timeout_s}")
+        print(f"    check_timeout_s: {task.check_timeout_s}")
         print(f"    max_attempts: {task.max_attempts}")
         if task.full_access:
             print(f"    full_access: true allowed={full_access_allowed}")

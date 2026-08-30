@@ -75,6 +75,22 @@ class VerifyOrderTests(unittest.TestCase):
             result.raw_output_excerpt,
         )
 
+    def test_check_timeout_honors_task_check_timeout_s(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            taskdir = Path(root) / "task"
+            taskdir.mkdir()
+            task = TaskSpec(
+                key="slow-check",
+                spec=LONG_SPEC,
+                check="sleep 5",
+                check_timeout_s=1,
+            )
+            result = self.verify(task, taskdir)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.check_timed_out)
+        self.assertIn("check timed out after 1s", result.raw_output_excerpt)
+
 
 if __name__ == "__main__":
     unittest.main()

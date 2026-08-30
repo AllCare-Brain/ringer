@@ -591,6 +591,17 @@ class RingerCliTests(unittest.TestCase):
         self.assertNotEqual(returncode, 0)
         self.assertIn("[ringer.py] check timed out after 1s", output)
 
+    def test_check_timeout_argument_overrides_global_constant(self) -> None:
+        self.assertEqual(60, ringer.CHECK_TIMEOUT_S)
+        with tempfile.TemporaryDirectory(prefix="ringer-check-timeout-arg-") as tmp:
+            returncode, timed_out, output = asyncio.run(
+                ringer.Verifier._run_check("sleep 5", Path(tmp), timeout_s=1)
+            )
+
+        self.assertTrue(timed_out)
+        self.assertNotEqual(returncode, 0)
+        self.assertIn("[ringer.py] check timed out after 1s", output)
+
     def test_token_count_parser_accepts_colon_and_newline_formats(self) -> None:
         self.assertEqual(ringer.parse_token_count("tokens used: 1,234", r"tokens\s+used\s*:?\s*([0-9][0-9,]*)"), 1234)
         self.assertEqual(ringer.parse_token_count("tokens used\n5,678", r"tokens\s+used\s*:?\s*([0-9][0-9,]*)"), 5678)

@@ -33,7 +33,7 @@ EXCLUDED_AUTHORS = {
     "ramy barsoum",
     "allcare-brain-atlas[bot]",
 }
-EXCLUDED_AUTHOR_PREFIXES = ("claude",)
+EXCLUDED_AUTHOR_PREFIXES = ("claude", "cursor")
 EXCLUDED_HANDLES = {
     "justfinethanku",
     "natebjones-projects",
